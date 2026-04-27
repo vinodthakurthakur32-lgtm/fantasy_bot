@@ -50,7 +50,7 @@ TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_ID = os.getenv('ADMIN_ID', '').strip()
 
 # 2. Webhook Host detection
-WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL') or os.getenv('WEBHOOK_URL') or 'https://fantasy-bot-adkn.onrender.com'
+WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL')
 
 if not TOKEN or not ADMIN_ID:
     logging.error("❌ CRITICAL: BOT_TOKEN or ADMIN_ID is missing!")
@@ -233,17 +233,23 @@ def setup_webhook():
         webhook_url = f"{clean_host}/bot-webhook"
         logging.info(f"⚙️ Webhook Sync: Target URL is {webhook_url}")
         
-        current_info = bot.get_webhook_info()
-        if not current_info.url or current_info.url.strip('/') != webhook_url.strip('/'):
-            try:
+        try:
+            current_info = bot.get_webhook_info()
+            if not current_info.url or current_info.url.strip('/') != webhook_url.strip('/'):
                 bot.remove_webhook()
                 time.sleep(1)
                 bot.set_webhook(url=webhook_url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
                 logging.info(f"🚀 Webhook successfully set to: {webhook_url}")
-            except Exception as e:
-                logging.error(f"❌ Webhook Error: {e}")
-        else:
-            logging.info("✅ Webhook already configured correctly.")
+            else:
+                logging.info("✅ Webhook already configured correctly.")
+        except Exception as e:
+            logging.error(f"❌ Webhook Setup Error: {e}")
+
+# Trigger Webhook Setup if we have a host (Production)
+if WEBHOOK_HOST or os.getenv('RENDER'):
+    if not WEBHOOK_HOST:
+        logging.warning("⚠️ WEBHOOK_URL environment variable is missing!")
+    setup_webhook()
 
 # Only run webhook setup if NOT in local testing mode
 # ===================================================
@@ -1942,13 +1948,7 @@ def cmd_update_points(msg):
 # ===================================================
 
 if __name__ == "__main__":
-    logging.info("🚀 CrickTEAM11 Bot is starting...")
-    
-    # Detect if we are on Render. If not, use Polling for local testing.
-    if os.getenv('RENDER'):
-        setup_webhook()
-        server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
-    else:
-        bot.remove_webhook()
-        logging.info("🔄 Local Dev Detected: Starting Polling Mode...")
-        bot.infinity_polling()
+    # Local development ke liye polling use karein
+    bot.remove_webhook()
+    logging.info("🔄 Local Dev Detected: Starting Polling Mode...")
+    bot.infinity_polling()
