@@ -43,13 +43,18 @@ def init_sheets():
 
             if raw_creds:
                 try:
-                    # Clean the string: handle potential wrapping quotes from Render dashboard
-                    cleaned_raw = raw_creds.strip()
-                    if (cleaned_raw.startswith('"') and cleaned_raw.endswith('"')) or \
-                       (cleaned_raw.startswith("'") and cleaned_raw.endswith("'")):
-                        cleaned_raw = cleaned_raw[1:-1]
+                    # Render logic: JSON string mangling repair
+                    cleaned_raw = raw_creds.strip().strip("'").strip('"')
                     
-                    creds_info = json.loads(cleaned_raw)
+                    try:
+                        creds_info = json.loads(cleaned_raw)
+                    except json.JSONDecodeError:
+                        # Repair backslashes: Escape lone backslashes that trip up the parser
+                        import re
+                        repaired = re.sub(r'\\(?![/"\\bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', cleaned_raw)
+                        # Also fix literal newlines if any
+                        repaired = repaired.replace('\n', '\\n')
+                        creds_info = json.loads(repaired)
                 except Exception as e:
                     logging.error(f"❌ Failed to parse GOOGLE_CREDENTIALS: {e}")
                     # Fallback: Agar environment variable invalid hai toh local file check karein
@@ -77,10 +82,9 @@ def init_sheets():
                 pk = creds_info["private_key"]
                 if isinstance(pk, str):
                     # Render logic: literal \n characters in env vars must be actual newlines
-                    # We handle multiple levels of escaping
                     pk = pk.replace("\\n", "\n").replace("\\\\n", "\n")
                     # Remove literal quotes or whitespace that often get included accidentally
-                    pk = pk.strip().strip("'").strip('"').strip()
+                    pk = pk.strip().strip("'").strip('"')
                 creds_info["private_key"] = pk
 
             creds = Credentials.from_service_account_info(
@@ -217,6 +221,8 @@ def get_all_rows_safe(sheet_type):
 
     if sh:
         sheet = get_or_create_sheet(sh, sheet_type, headers)
-        return safe_api_call(sheet.get_all_records)
+        if sheet:
+            # Pass the function reference, not the result of the call
+            return safe_api_call(sheet.get_all_records)
 
     return []
