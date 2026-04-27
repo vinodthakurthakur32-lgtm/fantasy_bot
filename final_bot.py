@@ -50,7 +50,7 @@ TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_ID = os.getenv('ADMIN_ID', '').strip()
 
 # 2. Webhook Host detection
-WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL')
+WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL') or ""
 
 if not TOKEN or not ADMIN_ID:
     logging.error("❌ CRITICAL: BOT_TOKEN or ADMIN_ID is missing!")
@@ -87,20 +87,23 @@ def index():
 def health():
     return "OK", 200
 
-@server.route('/bot-webhook', methods=['POST'])
+@server.route('/bot-webhook', methods=['GET', 'POST'])
 def webhook():
     """Telegram Webhook Endpoint"""
+    if request.method == 'GET':
+        return "🤖 Webhook is active! Telegram sends updates here via POST.", 200
+
     if request.headers.get('content-type') == 'application/json':
         try:
             json_string = request.get_data().decode('utf-8')
-            logging.info(f"📩 Webhook Received: {json_string[:200]}")
+            logging.info(f"📩 Incoming Update: {json_string}")
             update = telebot.types.Update.de_json(json_string)
             if update:
                 bot.process_new_updates([update])
             return '', 200
         except Exception as e:
-            logging.error(f"❌ Webhook Dispatch Error: {e}")
-            return 'Error', 500
+            logging.error(f"❌ Webhook Error: {e}")
+            return '', 200 # Telegram ko 200 bhein taaki wo retry na kare
     else:
         abort(403)
 
@@ -245,10 +248,11 @@ def setup_webhook():
         except Exception as e:
             logging.error(f"❌ Webhook Setup Error: {e}")
 
-# Trigger Webhook Setup if we have a host (Production)
-if WEBHOOK_HOST or os.getenv('RENDER'):
-    if not WEBHOOK_HOST:
-        logging.warning("⚠️ WEBHOOK_URL environment variable is missing!")
+# Render detection for Webhook
+if os.getenv('RENDER') or WEBHOOK_HOST:
+    if not WEBHOOK_HOST and os.getenv('RENDER_EXTERNAL_URL'):
+        WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL')
+    
     setup_webhook()
 
 # Only run webhook setup if NOT in local testing mode
