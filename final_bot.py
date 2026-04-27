@@ -96,7 +96,7 @@ def webhook():
     if request.headers.get('content-type') == 'application/json':
         try:
             json_string = request.get_data().decode('utf-8')
-            logging.info(f"📩 Incoming Update: {json_string}")
+            logging.info(f"📩 Incoming Update ID: {json.loads(json_string).get('update_id')}")
             update = telebot.types.Update.de_json(json_string)
             if update:
                 bot.process_new_updates([update])
@@ -248,8 +248,8 @@ def setup_webhook():
         except Exception as e:
             logging.error(f"❌ Webhook Setup Error: {e}")
 
-# Render detection for Webhook
-if os.getenv('RENDER') or WEBHOOK_HOST:
+# Trigger Webhook Setup during module load for Gunicorn
+if os.getenv('RENDER') or (WEBHOOK_HOST and len(WEBHOOK_HOST) > 10):
     if not WEBHOOK_HOST and os.getenv('RENDER_EXTERNAL_URL'):
         WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL')
     
@@ -1539,7 +1539,7 @@ def callback_handler(call):
 @bot.callback_query_handler(func=lambda call: call.data == "app_home")
 def callback_app_home(call):
     bot.answer_callback_query(call.id)
-    cmd_start(call.message)
+    start_command(call.message)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_player_stats_"))
 def callback_show_player_stats(call):
