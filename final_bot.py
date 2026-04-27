@@ -28,6 +28,19 @@ from flask import Flask, request, abort
 # ===================================================
 # CONFIGURATION
 # ===================================================
+ROLES = ['bat', 'wk', 'ar', 'bowl', 'sub']
+ROLE_LIMITS = {
+    'wk': (1, 4),
+    'bat': (3, 6),
+    'ar': (1, 4),
+    'bowl': (3, 6),
+    'sub': (1, 4)
+}
+ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Substitute'}
+NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
+DB_FILE = "crickteam11.db"
+MIN_WITHDRAWAL = 200
+MATCHES = {}
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -91,10 +104,6 @@ def webhook():
     else:
         abort(403)
 
-# 🏏 Naye matches yahan add karein (Manual Update)
-MATCHES = {}
-MIN_WITHDRAWAL = 200
-
 def get_support_handle():
     return db.db_get_setting('SUPPORT_HANDLE', 'crick_support001')
 
@@ -146,9 +155,6 @@ def get_players(match_id):
     PLAYERS_CACHE[match_id] = formatted_data
     return formatted_data
 
-ROLES = ['bat', 'wk', 'ar', 'bowl', 'sub']
-
-DB_FILE = "crickteam11.db"
 user_active_match = {} # Tracks which match user is paying for
 user_deposit_amount = {} # Temporary store for deposit amount input
 temp_team_cache = {} # Selection cache
@@ -243,17 +249,6 @@ def setup_webhook():
 # ===================================================
 # CONSTANTS
 # ===================================================
-
-# Enforcing specific ranges as per requirements
-ROLE_LIMITS = {
-    'wk': (1, 4),
-    'bat': (3, 6),
-    'ar': (1, 4),
-    'bowl': (3, 6),
-    'sub': (1, 4)
-}
-ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Substitute'}
-NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
 
 # ===================================================
 # DATABASE FUNCTIONS
@@ -382,7 +377,8 @@ def start_command(message):
     c_url = f"https://t.me/{c_handle}"
 
     inline_markup = types.InlineKeyboardMarkup()
-    inline_markup.add(types.InlineKeyboardButton("📢 COPY CHANNEL USERNAME", callback_data=f"copy_channel_handle_{c_handle}"))
+    inline_markup.add(types.InlineKeyboardButton("📢 JOIN OFFICIAL CHANNEL", url=c_url))
+    inline_markup.add(types.InlineKeyboardButton("📋 COPY USERNAME", callback_data=f"copy_channel_handle_{c_handle}"))
 
     brief = (
         f"🏏 <b>Welcome to CrickTEAM11, {message.from_user.first_name}!</b> 🚀\n\n"
@@ -525,9 +521,7 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
             bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
         else:
             bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
-    
     except Exception as e:
-        print(f"Error in show_player_selection: {e}")
         logging.error(f"Error in show_player_selection: {e}")
         bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
 
@@ -1451,12 +1445,6 @@ def cmd_help(msg):
     )
     bot.send_message(msg.chat.id, help_text, reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
 
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    """Fallback handler for debugging"""
-    logging.info(f"📩 Message from {message.from_user.id}: {message.text}")
-    bot.reply_to(message, f"You said: {message.text}")
-
 @bot.message_handler(commands=['set_handle'])
 def cmd_set_handle(msg):
     if str(msg.from_user.id) != ADMIN_ID: return
@@ -1467,22 +1455,20 @@ def cmd_set_handle(msg):
         process_handle_setting(msg)
         return
 
-    text = (
-        "🛠 *SET HANDLES (Database Update)*\n\n"
-        "Aap yahan se Support aur Main Channel dono badal sakte hain.\n\n"
-        "📌 *Format:* `TYPE | VALUE` \n"
-        "📌 *Types:* `SUPPORT`, `CHANNEL`, ya `PAYMENT_ID` \n\n"
-        "✅ *Examples:*\n"
-        "• `SUPPORT | crick_support_new` \n"
-        "• `CHANNEL | crick_updates_main` \n\n"
-        "• `PAYMENT_ID | -1003909393820` \n\n"
-        "⚠️ *Note:* `@` symbol lagane ki zaroorat nahi hai, sirf username likhein."
+    help_msg = (
+        "🛠 *ADMIN: SET SYSTEM HANDLES*\n\n"
+        "Format: `TYPE | VALUE` \n"
+        "Types: `SUPPORT`, `CHANNEL`, `PAYMENT_ID` \n\n"
+        "✅ Example: `SUPPORT | crick_support_help`"
     )
-    sent = bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+    sent = bot.send_message(msg.chat.id, help_msg, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_handle_setting)
 
 def process_handle_setting(msg):
+    """Admin input handle karne ke liye jo Support ya Channel badalta hai"""
     try:
+        if "|" not in msg.text:
+            return bot.reply_to(msg, "❌ Invalid Format! Use `TYPE | VALUE`")
         parts = [p.strip() for p in msg.text.split("|")]
         # Proper Cleanup: Remove @ and backslashes in one go
         h_type, value = parts[0].upper(), parts[1].replace("@", "").replace("\\", "").strip()
@@ -1502,14 +1488,14 @@ def process_handle_setting(msg):
 
 @bot.message_handler(commands=['rules'])
 def cmd_rules(msg):
+    """Users ko scoring system samjhane ke liye"""
     rules = (
-        "📊 *SCORING*\n"
+        "📊 *CRICKTEAM11 SCORING SYSTEM*\n\n"
         "🏏 Run: +1 | 4s: +4 | 6s: +6\n"
         "⚽ Wicket: +25 | Maiden: +10\n"
         "👑 C: 2x | VC: 1.5x\n\n"
-        "🚫 *Locks:* Match start hote hi!\n"
-        "🏧 *Min Withdraw:* ₹200\n"
-        "📸 *Payout:* Winner payout ka screenshot yahi share kiya jayega."
+        "🚫 *Match Lock:* Match start hone par team edit nahi hogi.\n"
+        f"🏧 *Withdrawal:* Minimum ₹{MIN_WITHDRAWAL}"
     )
     bot.send_message(msg.chat.id, rules, parse_mode='Markdown')
 
@@ -1519,6 +1505,7 @@ def cmd_rules(msg):
 
 @bot.message_handler(commands=['test_sync'])
 def cmd_test_sync(msg):
+    """Google Sheets connection verify karne ke liye"""
     if str(msg.from_user.id) != ADMIN_ID:
         return
     bot.send_message(msg.chat.id, "🧪 Testing Google Sheets sync... Check console and your Sheet.")
