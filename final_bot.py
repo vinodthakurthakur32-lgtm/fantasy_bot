@@ -5,8 +5,10 @@ import json
 from datetime import datetime, timedelta
 import time
 import re
+import html
 from contextlib import contextmanager
 import logging
+import threading
 
 # Modular Imports
 try:
@@ -20,6 +22,7 @@ import sheets
 import ui
 import scoring
 
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', 'my_secret_token_123')
 from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -40,6 +43,16 @@ ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bo
 NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
 DB_FILE = "crickteam11.db"
 MIN_WITHDRAWAL = 200
+
+# FIX 4: Selection Cooldown
+_selection_cooldown = {}
+
+# SEC 2: Input Sanitization helper
+def sanitize_input(text, max_len=100):
+    if not text: return ""
+    clean = re.sub(r'<[^>]*?>', '', text) # Strip HTML
+    return clean[:max_len].strip()
+
 MATCHES = {}
 
 # Load environment variables from .env file (for local development)
@@ -50,20 +63,11 @@ TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_ID = os.getenv('ADMIN_ID', '').strip()
 
 # 2. Webhook Host detection
-WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL') or ""
+WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL') or f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
 
 if not TOKEN or not ADMIN_ID:
     logging.error("❌ CRITICAL: BOT_TOKEN or ADMIN_ID is missing!")
     raise ValueError("Missing essential Environment Variables.")
-
-# Bot Identity Check
-try:
-    # Use a temporary instance or the main one to check token validity
-    bot_user = telebot.TeleBot(TOKEN, threaded=False).get_me()
-    logging.info(f"🤖 Bot Connected: @{bot_user.username} (ID: {bot_user.id})")
-except Exception as e:
-    logging.error(f"❌ Invalid Bot Token: {e}")
-    raise
 
 def get_now():
     """Returns current time in IST (Indian Standard Time)"""
@@ -73,6 +77,9 @@ def get_now():
 
 def get_payment_channel():
     return db.db_get_setting('PAYMENT_CHANNEL_ID', os.getenv('PAYMENT_CHANNEL_ID', ADMIN_ID))
+
+def get_support_channel():
+    return db.db_get_setting('SUPPORT_CHANNEL_ID', os.getenv('SUPPORT_CHANNEL_ID', '-1003909393820'))
 
 PAYMENT_UPI = os.getenv('PAYMENT_UPI', "amankumar8879@ibl")
 
@@ -100,8 +107,14 @@ def webhook():
         try:
             json_string = request.get_data(as_text=True)
             update = telebot.types.Update.de_json(json_string)
+            
+            # SEC 1: Webhook Signature Verification
+            secret_header = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+            if WEBHOOK_SECRET and secret_header != WEBHOOK_SECRET:
+                return "Unauthorized", 403
+
             if update:
-                msg_type = "Message" if update.message else "Callback" if update.callback_query else "Update"
+                msg_type = "Message" if update.message else "ChannelPost" if update.channel_post else "Callback" if update.callback_query else "Update"
                 logging.info(f"🔔 Update ID {update.update_id} ({msg_type}) parsing to handlers...")
                 bot.process_new_updates([update])
             return '', 200
@@ -112,7 +125,8 @@ def webhook():
         abort(403)
 
 def get_support_handle():
-    return db.db_get_setting('SUPPORT_HANDLE', 'crick_support001')
+    # Handle ko saaf karke return karein taaki link hamesha sahi bane
+    return db.db_get_setting('SUPPORT_HANDLE', 'CRICK_Community001').replace('@', '').strip()
 
 def get_channel_handle():
     return db.db_get_setting('CHANNEL_HANDLE', 'crick_channel001')
@@ -124,17 +138,6 @@ def is_admin(user_id):
 def sync_matches_from_db():
     """Database se matches load karke global MATCHES dict mein dalta hai"""
     global MATCHES
-    
-    try:
-        # 1. Pull from Google Sheets
-        sheet_matches = sheets.get_all_rows_safe("MATCHES")
-        if sheet_matches:
-            for m in sheet_matches:
-                db.db_add_match(m['match_id'], m['name'], m['type'], m['deadline'])
-    except Exception as e:
-        logging.warning(f"⚠️ GSheets sync skipped during startup: {e}")
-
-    # 2. Then load everything from Local DB to Bot Memory
     db_matches = db.db_get_matches()
     for m in db_matches:
         try:
@@ -148,6 +151,9 @@ def sync_matches_from_db():
 
 # Memory cache to make UI interaction lightning fast
 PLAYERS_CACHE = {}
+
+# 🛠 Admin Active Match Context: To speed up player/point updates
+ADMIN_MATCH_CONTEXT = {}
 
 def get_players(match_id):
     """Database se players fetch karke role-wise dictionary return karega (With Cache)"""
@@ -169,6 +175,8 @@ user_active_match = {} # Tracks which match user is paying for
 user_deposit_amount = {} # Temporary store for deposit amount input
 temp_team_cache = {} # Selection cache
 user_active_order = {} # user_id -> order_id mapping
+# State tracking for replies (No manual 'Reply' needed in Telegram)
+ACTIVE_REPLY_STATE = {} # {chat_id: (ticket_id, user_id, orig_msg_id, orig_text)}
 
 def process_payment_success(user_id, amount, ref_id, match_context=None, conn=None):
     """
@@ -233,9 +241,20 @@ db.init_db()
 db.run_migrations()
 sync_matches_from_db()
 
+# 🆕 Async GSheets Sync: Taki bot start hone mein delay na ho
+def async_sheets_sync():
+    try:
+        sheet_matches = sheets.get_all_rows_safe("MATCHES")
+        if sheet_matches:
+            for m in sheet_matches:
+                db.db_add_match(m['match_id'], m['name'], m['type'], m['deadline'])
+            sync_matches_from_db() # Refresh memory cache after sheet sync
+    except: pass
+threading.Thread(target=async_sheets_sync, daemon=True).start()
+
 def setup_webhook():
     """Sets up the webhook for production environments"""
-    if WEBHOOK_HOST:
+    if WEBHOOK_HOST and os.getenv('RENDER'):
         clean_host = WEBHOOK_HOST.strip().strip('/')
         if not clean_host.startswith('http'):
             clean_host = f"https://{clean_host}"
@@ -248,7 +267,10 @@ def setup_webhook():
             if not current_info.url or current_info.url.strip('/') != webhook_url.strip('/'):
                 bot.remove_webhook()
                 time.sleep(0.5)
-                bot.set_webhook(url=webhook_url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+                # SEC 1: Set webhook with secret token
+                bot.set_webhook(url=webhook_url, drop_pending_updates=True, 
+                                allowed_updates=["message", "callback_query", "channel_post"],
+                                secret_token=WEBHOOK_SECRET)
                 logging.info(f"🚀 Webhook successfully set to: {webhook_url}")
             else:
                 logging.info("✅ Webhook already configured correctly.")
@@ -256,7 +278,9 @@ def setup_webhook():
             logging.error(f"❌ Webhook Setup Error: {e}")
 
 # Trigger Webhook Setup during module load for Gunicorn
-# Only run webhook setup if NOT in local testing mode
+if os.getenv('RENDER'):
+    setup_webhook()
+
 # ===================================================
 # CONSTANTS
 # ===================================================
@@ -350,11 +374,13 @@ def start_command(message):
     uid = str(message.from_user.id)
     logging.info(f"✅ Handler Triggered: /start command from {uid}")
 
-    # Check if this is a brand new user
-    existing_user = db.db_get_user(uid)
-    is_new_registration = existing_user is None
+    # ⚡ Optimized: Single DB call for Register + Get + LastSeen
+    is_new_registration, user_data = db.db_register_user_optimized(uid, message.from_user.username, message.from_user.first_name)
 
-    # 🔗 Referral Detection (Format: /start ref12345)
+    # Existing home message returning users ko milega as before
+    if is_new_registration:
+        send_onboarding_step1(message.chat.id, message.from_user.first_name)
+        return  # Tour start, baaki start_command skip
     referrer = None
     if len(message.text.split()) > 1:
         ref_data = message.text.split()[1]
@@ -363,8 +389,6 @@ def start_command(message):
             if potential_ref.isdigit() and potential_ref != uid:
                 referrer = potential_ref
 
-    db.db_create_user(uid, message.from_user.username, message.from_user.first_name)
-    
     # Sheets sync
     try:
         sheets.sync_wrapper({
@@ -381,35 +405,27 @@ def start_command(message):
         with db.get_db() as conn:
             conn.execute("UPDATE USERS SET referred_by = %s WHERE user_id = %s AND referred_by IS NULL", (referrer, uid))
     
-    db.db_update_last_seen(uid)
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🏆 CONTEST", "💰 WALLET", "⚾ MY TEAM", "👥 LEADERBOARD", "📊 STATS", "ℹ️ HELP")
 
     # Channel Link Logic
     c_handle = get_channel_handle().replace('@', '').strip()
     c_url = f"https://t.me/{c_handle}"
+    s_url = f"https://t.me/{get_support_handle()}"
 
     inline_markup = types.InlineKeyboardMarkup()
-    inline_markup.add(types.InlineKeyboardButton("📢 JOIN OFFICIAL CHANNEL", url=c_url))
-    inline_markup.add(types.InlineKeyboardButton("📋 COPY USERNAME", callback_data=f"copy_channel_handle_{c_handle}"))
+    inline_markup.add(types.InlineKeyboardButton("💬 PUBLIC QUERY GROUP", url=s_url))
+    inline_markup.add(types.InlineKeyboardButton("🔗 SHARE BOT", switch_inline_query=f"Join & Win: https://t.me/{bot.get_me().username}?start=ref{uid}"))
 
     brief = (
-        f"🏏 <b>Welcome to CrickTEAM11, {message.from_user.first_name}!</b> 🚀\n\n"
-        "Aap India ke sabse <b>TRUSTED</b> aur <b>HIGH-PAYOUT</b> platform par hain! \n\n"
-        "🔥 <b>Hum kyu behtar hain?</b>\n"
-        "• Dream11 apps 30% commission lete hain, par hum <b>10% se bhi kam</b>! 📉\n"
-        "• Hum <b>90% se zyada Prize Pool</b> wapas winners ko dete hain! 🤑\n"
-        "• <b>5,000+ Users</b> roz Hazaro jeet rahe hain! ✅\n"
-        "• <b>Fast Payout:</b> UPI par sirf 10 min mein! ⚡\n\n"
-        "📋 <b>Kaise Khele:</b>\n"
-        "1️⃣ ⚾ <b>MY TEAM</b> mein 11 best players chunein.\n"
-        "2️⃣ Captain (2x) & Vice-Captain (1.5x) chunein.\n"
-        "3️⃣ 🏆 <b>CONTEST</b> join karein aur jeetna shuru karein!\n\n"
-        "⚠️ <b>Niyam (Rules):</b>\n"
-        "• Match start hote hi team lock ho jayegi.\n"
-        f"• Min Withdrawal: ₹{MIN_WITHDRAWAL}\n"
-        "• /rules se scoring system check karein.\n\n"
-        "❓ Madad ke liye /help bhein ya niche button dabayein 👇"
+        f"🏏 <b>Welcome, {message.from_user.first_name}!</b>\n\n"
+        "� <b>90% Prize Pool</b> • ⚡ <b>Fast UPI Payout</b>\n\n"
+        "🎯 <b>Kaise jeetein:</b>\n"
+        "1️⃣ Team banao (11 players)\n"
+        "2️⃣ Captain/VC set karo\n"
+        "3️⃣ Contest join karo\n\n"
+        f"📈 <b>Min Withdrawal:</b> ₹{MIN_WITHDRAWAL}\n"
+        f"🔥 <b>Next:</b> Click <b>🏆 CONTEST</b> niche menu se match select karne ke liye!"
     )
     bot.send_message(message.chat.id, brief, reply_markup=markup, parse_mode='HTML')
     bot.send_message(message.chat.id, "👇 <b>Updates aur Winner Screenshots ke liye join karein:</b>", reply_markup=inline_markup, parse_mode='HTML')
@@ -436,13 +452,22 @@ def cmd_my_team(msg):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("team_slots_"))
 def callback_team_slots(call):
+    # ⚡ 1. Sabse pehle answer karein taki Telegram ka loading icon hat jaye
+    bot.answer_callback_query(call.id)
+
+    # Robust parsing for match_id
     parts = call.data.split("_")
+    if len(parts) < 3: return
+    
     match_id = parts[2]
     page = int(parts[3]) if len(parts) > 3 else 1
     uid = str(call.from_user.id)
-    
-    # Immediate feedback to avoid "laggy" button feel
-    bot.answer_callback_query(call.id)
+
+    # ⚡ Optimization: Fetch all teams for this user and match in one single query
+    # Loop ke andar db_get_team call karne se N+1 performance issue hota hai
+    all_user_teams = db.db_get_all_user_teams(uid, match_id)
+    # Create a lookup map: team_num -> data
+    teams_map = {int(t['team_num']): t for t in all_user_teams}
 
     markup = types.InlineKeyboardMarkup(row_width=5)
     buttons = []
@@ -452,9 +477,11 @@ def callback_team_slots(call):
     end_idx = start_idx + 10
     
     for i in range(start_idx, end_idx):
-        t = db_get_team(uid, match_id, i)
-        label = f"T{i}✅" if t and t.get('team_saved') else f"T{i}"
-        cb = f"view_team_{match_id}_{i}" if t and t.get('team_saved') else f"nav_bat_{match_id}_{i}"
+        t_data = teams_map.get(i)
+        is_saved = t_data and t_data.get('team_saved') == 1
+        
+        label = f"T{i}✅" if is_saved else f"T{i}"
+        cb = f"view_team_{match_id}_{i}" if is_saved else f"nav_bat_{match_id}_{i}"
         buttons.append(types.InlineKeyboardButton(label, callback_data=cb))
 
     markup.add(*buttons)
@@ -504,31 +531,44 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
             callback = f"sel_{match_id}_{team_num}_{role}_{player.replace(' ', '_')}"
             markup.add(types.InlineKeyboardButton(f"{status} {player}", callback_data=callback))
         
-        nav_row = []
-        if role != 'bat':
-            for r, next_r in NEXT_ROLES.items():
-                if next_r == role:
-                    nav_row.append(types.InlineKeyboardButton("⬅️ Back", callback_data=f"nav_{r}_{match_id}_{team_num}"))
-                    break
+        # 🆕 Role Switcher: Direct jump to any category
+        role_switcher = []
+        for r_code in ['bat', 'wk', 'ar', 'bowl', 'sub']:
+            label = r_code.upper()
+            if r_code == role:
+                label = f"» {label} «"
+            role_switcher.append(types.InlineKeyboardButton(label, callback_data=f"nav_{r_code}_{match_id}_{team_num}"))
         
+        markup.row(*role_switcher[:3])
+        markup.row(*role_switcher[3:])
+
+        nav_row = []
         if role == 'bowl':
             nav_row.append(types.InlineKeyboardButton("✅ SAVE TEAM", callback_data=f"team_save_{match_id}_{team_num}"))
-        else:
-            next_role = NEXT_ROLES[role]
-            nav_row.append(types.InlineKeyboardButton("➡️ Next", callback_data=f"nav_{next_role}_{match_id}_{team_num}"))
         
         markup.row(*nav_row)
         
-        time_left = get_time_left(match_id)
         role_min, role_max = ROLE_LIMITS[role]
         
-        # UX: Clear Progress Indicators
-        step = 1 if role == 'bat' else 2 if role == 'wk' else 3 if role == 'ar' else 4
-        text = f"🏏 *Match:* {MATCHES[match_id]['name']} (T{team_num})\n"
-        text += f"📝 *Step {step}/4: Select {ROLE_NAMES[role]}*\n\n"
-        text += f"✅ Selected: {len(selected)}/{role_max} (Min: {role_min})\n"
-        text += f"🏟 Total Squad: {total}/11\n"
-        text += f"⏳ Deadline: {time_left}"
+        # 🆕 Live Squad Summary
+        squad_list = []
+        for r_key in ['bat', 'wk', 'ar', 'bowl']:
+            p_names = team.get(r_key, [])
+            if p_names:
+                squad_list.append(f"*{ROLE_NAMES[r_key][:3]}:* " + ", ".join(p_names))
+        
+        summary_text = "\n".join(squad_list) if squad_list else "_Abhi tak koi player select nahi kiya._"
+
+        text = (
+            f"🏏 *Team Builder - {MATCHES[match_id]['name']}*\n"
+            f"Slot: `T{team_num}` | Section: *{ROLE_NAMES[role]}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Category: `{len(selected)}/{role_max}` | 👥 Squad: `{total}/11`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 *Aapki Team:*\n{summary_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 *Players select karne ke liye tap karein:*"
+        )
 
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
@@ -575,8 +615,36 @@ def callback_team_save(call):
         callback_cv_menu(call)
         return
 
+    # FIX 2 & ADD 6: Team Preview Before Final Save
+    if not team.get('captain') or not team.get('vice_captain'):
+        bot.answer_callback_query(call.id, "👑 Pehle Captain aur VC select karo!", show_alert=True)
+        callback_cv_menu(call)
+        return
+
+    preview_text = f"📝 *TEAM PREVIEW (T{team_num})*\n"
+    for role_key in ROLES:
+        players = team.get(role_key, [])
+        if players:
+            preview_text += f"\n*{ROLE_NAMES[role_key]}:* {', '.join(players)}"
+    
+    preview_text += f"\n\n👑 *C:* {team.get('captain')}\n⭐ *VC:* {team.get('vice_captain')}"
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ CONFIRM & SAVE", callback_data=f"final_confirm_save_{match_id}_{team_num}"),
+        types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}")
+    )
+    bot.edit_message_text(preview_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("final_confirm_save_"))
+def callback_final_confirm_save(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num = parts[3], int(parts[4])
+    
+    team = db_get_team(uid, match_id, team_num)
     team['team_saved'] = 1
-    db_save_team(uid, team, match_id, team_num) # Persistent Save
+    db_save_team(uid, team, match_id, team_num)
 
     # Final Sync to Sheets (One row per team)
     all_players = []
@@ -632,8 +700,21 @@ def callback_view_team(call):
     markup = types.InlineKeyboardMarkup(row_width=1)
     if not is_match_locked(match_id):
         markup.add(types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}"))
+    markup.add(types.InlineKeyboardButton("📊 POINTS BREAKDOWN", callback_data=f"pts_break_{match_id}_{team_num}"))
     markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
     
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pts_break_"))
+def callback_points_breakdown(call):
+    parts = call.data.split("_")
+    match_id, team_num = parts[2], int(parts[3])
+    uid = str(call.from_user.id)
+    
+    team = db_get_team(uid, match_id, team_num)
+    player_stats_map = db.db_get_player_live_stats_map(match_id)
+    
+    markup, text = ui.team_points_breakdown_render(match_id, team_num, team, player_stats_map)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("copy_upi_"))
@@ -649,9 +730,17 @@ def callback_select_player(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("nav_"))
 def callback_navigate_role(call):
     parts = call.data.split("_")
+    if len(parts) < 4: return
+    
     role = parts[1]
     match_id = parts[2]
-    team_num = int(parts[3])
+    try:
+        team_num = int(parts[3])
+    except ValueError:
+        # Handle case where match_id might have underscores
+        team_num = int(parts[-1])
+        match_id = "_".join(parts[2:-1])
+        
     show_player_selection(call.message.chat.id, str(call.from_user.id), role, match_id, team_num, call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("set_cv_menu_"))
@@ -730,10 +819,12 @@ def cmd_contest(msg):
             status = f"🏏 [{info['type']}] {day_str} {deadline.strftime('%H:%M')}"
         markup.add(types.InlineKeyboardButton(f"{status} {info['name']} - {get_time_left(mid)}", callback_data=f"show_match_{mid}"))
     
-    text = "🏆 *UPCOMING MATCHES*\n\nSelect a match to join contests:"
+    text = "🏆 *Matches*\n\n👉 *Next: Select a match to join contests*"
     if not has_any_team:
-        text += "\n\n⚠️ *IMP:* Aapne abhi tak koi team nahi banayi hai.\n👉 Pehle /myteam command se team banayein, phir contest join karein."
-        markup.add(types.InlineKeyboardButton("⚾ CREATE TEAM NOW", callback_data="cmd_my_team_nav"))
+        text += "\n\n⚠️ *No team?*\n👉 Pehle team banao"
+        markup.add(types.InlineKeyboardButton("🏏 CREATE TEAM", callback_data="cmd_my_team_nav"))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="app_home"))
 
     bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
 
@@ -778,9 +869,10 @@ def callback_confirm_join(call):
 def callback_show_match(call):
     mid = call.data.split("_")[2]
     uid = str(call.from_user.id)
+    default_fee = 100
     
     info = MATCHES.get(mid)
-    stats = db.get_contest_stats(mid)
+    stats = db.get_contest_stats(mid, default_fee)
     user_summary = db.get_user_match_summary(uid, mid)
     has_team = db_has_saved_team(uid, mid)
     time_left = get_time_left(mid)
@@ -788,15 +880,54 @@ def callback_show_match(call):
     # Dynamically fetch all configured contests for this match
     configs = db.db_get_all_contest_configs(mid)
 
-    markup, text = ui.match_dashboard_render(mid, info, stats, user_summary, time_left, configs)
+    markup, text = ui.match_dashboard_render(mid, info, stats, user_summary, time_left, configs, default_fee)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("breakup_"))
+def callback_prize_breakup(call):
+    parts = call.data.split("_")
+    match_id, fee = parts[1], int(parts[2])
+    
+    # Get current contest config to know max slots
+    config = db.db_get_contest_config(match_id, fee)
+    slots = config['max_slots'] if config else 50
+    
+    markup, text = ui.prize_breakdown_render(match_id, fee, slots)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.answer_callback_query(call.id, "Error loading breakup.")
 
 @bot.message_handler(commands=['set_contest_size'])
 def cmd_set_contest_size(msg):
     if not is_admin(msg.from_user.id): return
-    help_txt = "📏 *SET CONTEST SIZE*\n\nFormat: `match_id | entry_fee | max_slots`\nExample: `m1 | 100 | 200`"
+    help_txt = (
+        "📏 *ADD/UPDATE CONTEST*\n\n"
+        "Format: `match_id | entry_fee | max_slots`\n\n"
+        "💡 *Note:* \n"
+        "• ₹100+ = 🥇 Mega\n"
+        "• ₹50-99 = 🥈 Medium\n"
+        "• Under ₹50 = 🥉 Small\n\n"
+        "Example: `demo_m1 | 100 | 50`"
+    )
     sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_contest_size)
+
+@bot.message_handler(commands=['delete_contest'])
+def cmd_delete_contest(msg):
+    if not is_admin(msg.from_user.id): return
+    help_txt = "🗑️ *DELETE CONTEST*\n\nFormat: `match_id | entry_fee` \nExample: `demo_m1 | 20`"
+    sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_delete_contest)
+
+def process_delete_contest(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, fee = parts[0], int(parts[1])
+        db.db_delete_contest(mid, fee)
+        bot.reply_to(msg, f"✅ Match `{mid}` se ₹{fee} wala contest delete ho gaya!")
+    except:
+        bot.reply_to(msg, "❌ Error! Format: `match_id | fee` use karein.")
 
 def process_contest_size(msg):
     try:
@@ -806,6 +937,32 @@ def process_contest_size(msg):
         bot.reply_to(msg, f"✅ *Contest Configured!*\nMatch: `{mid}`\nFee: ₹{fee}\nMax Slots: {slots}\n\nAb users ko 70% winners wala breakup dikhega.")
     except Exception as e:
         bot.reply_to(msg, "❌ Error! Use format: `mid | fee | slots`")
+
+@bot.message_handler(commands=['set_prize_config'])
+def cmd_set_prize_config(msg):
+    if not is_admin(msg.from_user.id): return
+    help_txt = (
+        "🏆 *PRIZE DISTRIBUTION CONFIG*\n\n"
+        "Format: `Commission | Winners% | R1% | R2% | R3%`\n\n"
+        "Example: `10 | 70 | 35 | 20 | 12`"
+    )
+    sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_prize_config)
+
+def process_prize_config(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        comm, wins, r1, r2, r3 = parts[0], parts[1], parts[2], parts[3], parts[4]
+        
+        db.db_set_setting('PRIZE_COMMISSION', comm)
+        db.db_set_setting('PRIZE_WINNERS_PCT', wins)
+        db.db_set_setting('PRIZE_R1_PCT', r1)
+        db.db_set_setting('PRIZE_R2_PCT', r2)
+        db.db_set_setting('PRIZE_R3_PCT', r3)
+        
+        bot.reply_to(msg, "✅ *Prize Logic Updated!* \n\nAb sabhi naye breakup isi calculation par chalenge.")
+    except Exception as e:
+        bot.reply_to(msg, "❌ Error! Format: `10 | 70 | 35 | 20 | 12` check karein.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("team_slots_nav_"))
 def callback_team_slots_nav(call):
@@ -835,7 +992,7 @@ def callback_pay_now(call):
     # Handle direct wallet deposit (without match)
     if len(parts) > 2 and parts[2] == "wallet":
         match_id, team_num = "wallet", "0"
-        amount = user_deposit_amount.get(uid, 100)
+        amount = int(db.db_get_user_state(uid, 'deposit_amount') or 100)
     else:
         match_id, team_num, amount = parts[2], parts[3], int(parts[4])
         team = db_get_team(uid, match_id, int(team_num)) or {}
@@ -853,29 +1010,18 @@ def send_payment_ui(chat_id, uid, amount, match_id, team_num):
     """Centralized function to send payment instructions"""
     context = f"{match_id}_{team_num}"
     order_id = db.db_create_order(uid, amount, context)
-    user_deposit_amount[uid] = amount
-    user_active_match[uid] = context
+    db.db_set_user_state(uid, 'deposit_amount', amount)
+    db.db_set_user_state(uid, 'active_match_context', context)
 
     pay_msg = (
-        "💳 *PAYMENT VERIFICATION METHOD*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 *UPI ID:* `{PAYMENT_UPI}`\n"
-        f"💰 *Payable Amount:* `₹{amount}`\n"
-        f"🆔 *Order ID:* `{order_id}`\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ *Aapke paas 2 options hain:*\n\n"
-        "1️⃣ *UTR ID (Fastest):* ⚡\n"
-        "Payment ke baad 12-digit ka **UTR Number** yahan chat mein likhein. System turant check karke balance add kar dega. ✅\n\n"
-        "2️⃣ *SCREENSHOT (Manual):* ⏳\n"
-        "Screenshot bhejne par Admin manual check karega (5-10 mins). Photo niche bhein.\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "❓ *UTR Kaise Milega?*\n"
-        "App ki 'History' ya 'Transaction Details' mein 12-digit ka *UTR/Ref No.* dekhein.\n\n"
-        "📝 *Note:* GPay/PhonePe ke 'Add Note' ya 'Message' section mein Order ID `{order_id}` zaroor likhein."
+        "💳 *Add Money*\n\n"
+        f"Amount: *₹{amount}*\n"
+        f"UPI: `{PAYMENT_UPI}`\n\n"
+        "👉 *After payment:*\n"
+        "Send **UTR number** ya **Screenshot** isi chat mein bhein.\n\n"
+        "⚡ *Fast verification*"
     )
-    if match_id != "wallet":
-        pay_msg += f"\n\n🏏 Match: {MATCHES[match_id]['name']}\n⚾ Team Slot: {team_num}"
-    
+
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(f"📋 Copy UPI ID: {PAYMENT_UPI}", callback_data=f"copy_upi_{PAYMENT_UPI}"))
     
@@ -1066,7 +1212,8 @@ def handle_utr_input(msg):
                 bot.reply_to(msg, "⚠️ *RED FLAG:* Baar-baar galat UTR bhejne ke karan aapka account review mein daal diya gaya hai.")
                 bot.send_message(get_payment_channel(), f"🚩 *RED FLAG:* User {uid} ko random UTR spamming ke liye flag kiya gaya hai.")
             else:
-                bot.reply_to(msg, f"❌ *No Active Order:* Pehle 'ADD MONEY' par click karein aur ₹{user_deposit_amount.get(uid, '')} pay karein, uske baad UTR bhein.\n\n⚠️ Caution: Galat UTR par ID block ho sakti hai. (Attempts left: {3-failed_count})")
+                pending_amt = db.db_get_user_state(uid, 'deposit_amount') or "required"
+                bot.reply_to(msg, f"❌ *No Active Order:* Pehle 'ADD MONEY' par click karein aur ₹{pending_amt} pay karein, uske baad UTR bhein.\n\n⚠️ Caution: Galat UTR par ID block ho sakti hai. (Attempts left: {3-failed_count})")
             return
 
         # 4. Success Flow
@@ -1274,24 +1421,23 @@ def cmd_wallet(msg):
     bot_info = bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref{uid}"
 
-    text = f"💰 *WALLET*\n\n"
-    text += f"👤 *User:* {user['first_name']}\n"
-    text += f"💵 *Available Balance:* ₹{balance}\n"
-    text += (
-        f"\n🎁 *REFER & EARN*\n"
-        f"Doston ko invite karein aur payein *₹10 Bonus*! 💸\n"
-        f"_(Condition: Dost pehla contest join kare)_\n\n"
-        f"🔗 *Link:* `{ref_link}`"
+    text = (
+        "💰 *Wallet*\n\n"
+        f"Balance: *₹{balance}*\n\n"
+        "➕ Add Money\n"
+        "💸 Withdraw\n"
+        "🎁 Refer & Earn\n\n"
+        f"⚠️ Min Withdraw: ₹{MIN_WITHDRAWAL}\n\n"
+        "👉 *Next: Add Money to join paid contests*"
     )
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("➕ ADD MONEY", callback_data="init_deposit"))
-    if balance >= MIN_WITHDRAWAL:
-        markup.add(types.InlineKeyboardButton("🏧 WITHDRAW MONEY", callback_data="req_withdraw"))
-    else:
-        text += f"\n\n_⚠️ Min Withdrawal: ₹{MIN_WITHDRAWAL}_"
-
-    markup.add(types.InlineKeyboardButton("🚀 SHARE LINK", switch_inline_query=f"India's best Fantasy Bot! 🏏 Join & Win: {ref_link}"))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("➕ Add Money", callback_data="init_deposit"),
+        types.InlineKeyboardButton("💸 Withdraw", callback_data="req_withdraw"),
+        types.InlineKeyboardButton("🎁 Refer & Earn", switch_inline_query=f"Join & Win: {ref_link}"),
+        types.InlineKeyboardButton("🏠 Home", callback_data="app_home")
+    )
     
     bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
 
@@ -1299,8 +1445,42 @@ def cmd_wallet(msg):
 def callback_init_deposit(call):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("❌ CANCEL PAYMENT", callback_data="payment_cancel"))
-    msg = bot.send_message(call.message.chat.id, "💰 *Enter amount* to add to your wallet:\n(Min: ₹10, Max: ₹50,000)", reply_markup=markup, parse_mode='Markdown')
-    bot.register_next_step_handler(msg, process_deposit_input)
+    sent = bot.send_message(call.message.chat.id, "💰 *Enter amount* to add to your wallet:\n(Min: ₹10, Max: ₹50,000)", reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_deposit_input)
+
+# ADD 1: Transaction History
+@bot.callback_query_handler(func=lambda call: call.data == "show_history")
+@bot.message_handler(commands=['history'])
+def cmd_history(msg_or_call):
+    is_cb = isinstance(msg_or_call, telebot.types.CallbackQuery)
+    msg = msg_or_call.message if is_cb else msg_or_call
+    uid = str(msg_or_call.from_user.id)
+    
+    history = db.db_get_transaction_history(uid)
+    if not history:
+        text = "📜 *Transaction History*\n\nAapne abhi tak koi transaction nahi ki hai."
+    else:
+        text = "📜 *Last 10 Transactions*\n\n"
+        for item in history:
+            sign = "✅ +" if item['type'] == 'CREDIT' else "❌ -"
+            date = item['timestamp'][5:16] # Format: 04-24 19:30
+            text += f"`{date}` | {sign}₹{abs(item['amount'])} | {item['reference_id'][:12]}...\n"
+    
+    if is_cb: bot.answer_callback_query(msg_or_call.id)
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+# ADD 3: Referral Dashboard
+@bot.message_handler(commands=['myreferrals'])
+def cmd_my_referrals(msg):
+    uid = str(msg.from_user.id)
+    stats = db.db_get_referral_stats(uid)
+    text = (
+        "🎁 *Referral Dashboard*\n\n"
+        f"👥 Total Referrals: `{stats['total']}`\n"
+        f"💰 Total Bonus Earned: `₹{stats['bonus']}`\n\n"
+        "Aapka referral bonus tabhi credit hoga jab aapka referral pehla contest join karega!"
+    )
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
 
 def process_deposit_input(msg):
     uid = str(msg.from_user.id)
@@ -1342,8 +1522,9 @@ def cmd_withdraw(msg):
 def process_withdrawal_details(msg):
     uid = str(msg.from_user.id)
     try:
-        # Input string split: "binod@oksbi 500" -> ["binod@oksbi", "500"]
-        parts = msg.text.split()
+        # SEC 2: Sanitize and parse
+        clean_text = sanitize_input(msg.text, 100)
+        parts = clean_text.split()
         if len(parts) < 2:
             bot.reply_to(msg, "❌ Format galat hai! Dubara `/withdraw` dabayein aur is tarah bhejien:\n`UPI_ID AMOUNT`", parse_mode='Markdown')
             return
@@ -1371,7 +1552,8 @@ def process_withdrawal_details(msg):
         admin_markup = types.InlineKeyboardMarkup()
         admin_markup.add(
             types.InlineKeyboardButton("✅ APPROVE", callback_data=f"wd_approve_{req_id}"),
-            types.InlineKeyboardButton("❌ REJECT", callback_data=f"wd_reject_{req_id}")
+            types.InlineKeyboardButton("❌ REJECT", callback_data=f"wd_reject_{req_id}"),
+            types.InlineKeyboardButton("➡️ SENT", callback_data=f"wd_sent_{req_id}")
         )
         bot.send_message(get_payment_channel(), f"🔔 *NEW WITHDRAWAL*\nUser: {msg.from_user.first_name}\nID: `{uid}`\nAmt: ₹{amount}\nUPI: `{upi_id}`", reply_markup=admin_markup, parse_mode='Markdown')
     except Exception as e:
@@ -1387,20 +1569,26 @@ def callback_withdrawal_admin(call):
     with db.get_db() as conn:
         conn.execute("SELECT * FROM WITHDRAWALS WHERE id=%s", (req_id,))
         req = conn.fetchone()
-        if not req or req['status'] != 'pending': 
+        if not req or req['status'] not in ['pending', 'processing']: 
             bot.answer_callback_query(call.id, "Already processed!")
             return
 
         if action == "approve":
-            # Wallet se amount debit (minus) karein
+            # ADD 4: Stage -> Processing
+            db.db_update_withdrawal_status(req_id, 'processing')
+            bot.send_message(req['user_id'], "⏳ *Withdrawal Processing!*\n\nAapki request verify ho gayi hai, paise bhein ja rahe hain.")
+            bot.edit_message_text(f"⏳ Processing: ₹{req['amount']} to {req['user_id']}", get_payment_channel(), call.message.message_id)
+        
+        elif action == "sent":
+            # ADD 4: Final Stage -> Sent
             ref = f"WD_REF_{req_id}"
             conn.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
                          (req['user_id'], -req['amount'], ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-            conn.execute("UPDATE WITHDRAWALS SET status='approved' WHERE id=%s", (req_id,))
-            bot.edit_message_text(f"✅ Approved: ₹{req['amount']} to {req['user_id']}", get_payment_channel(), call.message.message_id)
-            bot.send_message(req['user_id'], f"✅ *Withdrawal Success!*\n₹{req['amount']} aapke UPI `{req['upi_id']}` par bhej diye gaye hain. Admin abhi screenshot *Support Channel* par share kar raha hai.")
+            db.db_update_withdrawal_status(req_id, 'sent')
+            bot.edit_message_text(f"✅ Sent: ₹{req['amount']} to {req['user_id']}", get_payment_channel(), call.message.message_id)
+            bot.send_message(req['user_id'], f"✅ *Sent to UPI!*\n₹{req['amount']} aapke account mein credit kar diye gaye hain.")
         else:
-            conn.execute("UPDATE WITHDRAWALS SET status='rejected' WHERE id=%s", (req_id,))
+            db.db_update_withdrawal_status(req_id, 'rejected')
             bot.send_message(req['user_id'], f"❌ *Withdrawal Rejected*\nAapki ₹{req['amount']} ki request cancel kar di gayi hai.")
             bot.edit_message_text(f"❌ Rejected: ₹{req['amount']} for {req['user_id']}", get_payment_channel(), call.message.message_id)
     bot.answer_callback_query(call.id)
@@ -1434,37 +1622,54 @@ def cmd_stats(msg):
 @bot.message_handler(func=lambda m: m.text and "HELP" in m.text)
 def cmd_help(msg):
     # Clean handles properly for link generation
-    s_handle = get_support_handle().replace('@', '').replace('\\', '').strip()
+    s_handle = get_support_handle()
     c_handle = get_channel_handle().replace('@', '').replace('\\', '').strip()
     
     support_url = f"https://t.me/{s_handle}"
     channel_url = f"https://t.me/{c_handle}"
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📢 Main Channel", url=channel_url))
-    markup.add(types.InlineKeyboardButton("📸 Support & Screenshots", url=support_url))
-    
-    help_text = (
-        "❓ <b>HELP CENTER</b>\n\n"
-        "⚾ /myteam - Build/Edit Team\n"
-        "🏆 /contest - Join Matches\n"
-        "💰 /wallet - Deposit & Payout\n"
-        "📊 /stats - Your Points\n"
-        "📜 /rules - Scoring System\n"
-        "📸 <b>Note:</b> Winner payout ke screenshots Support Channel par milenge.\n\n"
-        f"📞 Support ID: <code>@{s_handle}</code>\n"
-        f"📢 Channel ID: <code>@{c_handle}</code>\n\n"
-        "☝️ <i>Upar diye gaye ID par tap karke copy karein. Agar link kaam na kare toh Telegram search mein paste karein.</i>"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🏏 Create Team", callback_data="cmd_my_team_nav"),
+        types.InlineKeyboardButton("🏆 Contests", callback_data="contest_list")
     )
+    markup.add(
+        types.InlineKeyboardButton("💰 Wallet", callback_data="app_wallet"),
+        types.InlineKeyboardButton("📊 My Rank", callback_data="app_myrank")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🎫 Support Ticket", callback_data="start_support"),
+        types.InlineKeyboardButton("📢 Main Channel", url=channel_url)
+    )
+    
+    if is_admin(msg.from_user.id):
+        markup.add(types.InlineKeyboardButton("🛠 ADMIN CONTROL GUIDE", callback_data="adm_nav_help"))
+    
+    help_text = f"""
+❓ <b>BOT FEATURES & COMMANDS</b>
+━━━━━━━━━━━━━━━━━━━━
+⚾ <b>Team Management:</b> /myteam - Team banayein aur edit karein.
+🏆 <b>Join Matches:</b> /contest - Available contests mein join karein.
+💰 <b>Wallet:</b> /wallet - Balance, Deposit, aur Withdrawal (/withdraw) manage karein.
+📊 <b>Live Rank:</b> /myrank - Live match ke waqt apna rank dekhein.
+📈 <b>User Stats:</b> /stats - Apni total performance dekhein.
+🎁 <b>Referrals:</b> /myreferrals - Apne referral bonus ki details dekhein.
+📜 <b>History:</b> /history - Apni transaction history dekhein.
+🏆 <b>Leaderboard:</b> /leaderboard - Top 10 users dekhein.
+⚖️ <b>Rules:</b> /rules - Scoring system samjhein.
+🎫 <b>Support:</b> /support - Kisi bhi problem ke liye ticket banayein.
+🚀 <b>Tour:</b> /start - Bot ka intro tour dobara dekhne ke liye.
+
+📞 <b>Official Support:</b> @{s_handle}
+"""
     bot.send_message(msg.chat.id, help_text, reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
 
 @bot.message_handler(commands=['set_handle'])
 def cmd_set_handle(msg):
     if str(msg.from_user.id) != ADMIN_ID: return
 
-    # ⚡ Check for one-line command (e.g. /set_handle PAYMENT_ID | -100...)
     if "|" in msg.text:
-        msg.text = re.sub(r'^/\w+\s*', '', msg.text) # Strip command prefix
+        msg.text = re.sub(r'^/\w+\s*', '', msg.text)
         process_handle_setting(msg)
         return
 
@@ -1477,6 +1682,145 @@ def cmd_set_handle(msg):
     sent = bot.send_message(msg.chat.id, help_msg, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_handle_setting)
 
+@bot.message_handler(commands=['support'])
+def cmd_support(msg):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ CANCEL", callback_data="support_cancel"))
+    sent = bot.send_message(msg.chat.id,
+        "🎫 *SUPPORT TICKET*\n\n"
+        "Apni problem likhkar bhejein:\n"
+        "(Payment issue, Team issue, kuch bhi)\n\n"
+        "👇 Niche type karo:",
+        reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_support_ticket)
+
+def process_support_ticket(msg):
+    uid = str(msg.from_user.id)
+    issue = sanitize_input(msg.text, max_len=500)
+    ticket_id = db.db_create_ticket(uid, issue)
+    
+    bot.reply_to(msg,
+        f"✅ *Ticket #{ticket_id} Created!*\n\n"
+        f"Admin jald hi reply karega.\n"
+        f"Ticket ID: <b>#{ticket_id}</b>",
+        parse_mode='HTML')
+    
+    # Admin ko notify karo with resolve button
+    admin_markup = types.InlineKeyboardMarkup()
+    admin_markup.add(
+        types.InlineKeyboardButton("💬 REPLY", callback_data=f"ticket_reply_{ticket_id}_{uid}"),
+        types.InlineKeyboardButton("✅ RESOLVE", callback_data=f"ticket_resolve_{ticket_id}_{uid}")
+    )
+    user = db.db_get_user(uid)
+    support_chan = get_support_channel()
+    bot.send_message(support_chan,
+        f"🎫 <b>NEW SUPPORT TICKET #{ticket_id}</b>\n\n"
+        f"👤 User: {html.escape(user['first_name'])}\n"
+        f"🆔 ID: <code>{uid}</code>\n\n"
+        f"📝 Issue:\n{html.escape(issue)}",
+        reply_markup=admin_markup, parse_mode='HTML')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ticket_reply_"))
+def callback_ticket_reply(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "🚫 Sirf Main Admin reply kar sakta hai!", show_alert=True)
+        return
+        
+    parts = call.data.split("_")
+    ticket_id, user_id = parts[2], parts[3]
+    orig_text = call.message.text # Original ticket ka text save kar lo
+    
+    try:
+        # 1. Pehle loading khatam karein
+        bot.answer_callback_query(call.id, "Type your reply now!")
+
+        # 2. State set karein (Strict Chat ID tracking)
+        ACTIVE_REPLY_STATE[int(call.message.chat.id)] = (ticket_id, user_id, call.message.message_id, orig_text)
+        
+        bot.send_message(call.message.chat.id,
+            f"💬 <b>Ticket #{ticket_id}</b> ka reply likho:\n\n"
+            f"Agla message jo aap bhein ge, wo seedha user ko chala jayega.",
+            parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Reply Trigger Error: {e}")
+        bot.answer_callback_query(call.id, "❌ Error: Prompt nahi bhej paya.", show_alert=True)
+
+@bot.message_handler(func=lambda m: int(m.chat.id) in ACTIVE_REPLY_STATE and not (m.text and m.text.startswith('💬')) and not (m.text and m.text.startswith('/')))
+@bot.channel_post_handler(func=lambda m: int(m.chat.id) in ACTIVE_REPLY_STATE and not (m.text and m.text.startswith('💬')) and not (m.text and m.text.startswith('/')))
+def handle_ticket_reply_intercept(msg):
+    """Admin ka reply intercept karega (Loop se bachne ke liye prompt messages ko ignore karega)"""
+    chat_id = int(msg.chat.id)
+    logging.info(f"📥 Intercepted reply in chat {chat_id}")
+    
+    data = ACTIVE_REPLY_STATE.pop(chat_id)
+    ticket_id, user_id, orig_msg_id, orig_text = data
+    send_ticket_reply(msg, ticket_id, user_id, orig_msg_id, orig_text, chat_id)
+
+def send_ticket_reply(msg, ticket_id, user_id, orig_msg_id, orig_text, chat_id):
+    if not msg.text:
+        bot.send_message(chat_id, "❌ Reply sirf text mein ho sakta hai.")
+        return
+
+    target_user = int(str(user_id).strip())
+    logging.info(f"🚀 Delivering reply for Ticket #{ticket_id} to User: {target_user}")
+
+    safe_reply = html.escape(msg.text)
+    safe_orig = html.escape(orig_text)
+
+    try:
+        # 1. User ko reply deliver karein
+        bot.send_message(target_user,
+            f"📩 <b>Support Reply — Ticket #{ticket_id}</b>\n\n"
+            f"{safe_reply}\n\n"
+            f"<i>Aur help chahiye? /support likhein</i>",
+            parse_mode='HTML')
+        
+        bot.send_message(chat_id, f"✅ Ticket #{ticket_id} ka reply user ko bhej diya gaya hai.")
+        logging.info(f"✅ Reply delivered to {target_user}")
+
+    except Exception as e:
+        logging.error(f"❌ Delivery failed: {e}")
+        bot.send_message(chat_id, f"⚠️ Delivery Error: User tak message nahi gaya (Shayad block kiya hai).")
+
+    # 2. Support Channel mein ticket update karein (Hamesha chale)
+    try:
+        new_markup = types.InlineKeyboardMarkup()
+        new_markup.add(types.InlineKeyboardButton("✅ RESOLVE", callback_data=f"ticket_resolve_{ticket_id}_{user_id}"))
+        
+        status_text = f"{safe_orig}\n\n✅ <b>REPLIED:</b> <i>{safe_reply[:60]}...</i>"
+        bot.edit_message_text(
+            status_text,
+            chat_id=chat_id,
+            message_id=int(orig_msg_id),
+            reply_markup=new_markup,
+            parse_mode='HTML'
+        )
+        logging.info(f"✅ Ticket UI updated.")
+    except Exception as e:
+        logging.error(f"❌ UI Update Error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ticket_resolve_"))
+def callback_ticket_resolve(call):
+    if not is_admin(call.from_user.id): return
+    parts = call.data.split("_")
+    ticket_id, user_id = parts[2], parts[3]
+    db.db_resolve_ticket(ticket_id)
+    bot.answer_callback_query(call.id, "Ticket Resolved!", show_alert=True)
+    bot.send_message(user_id,
+        f"✅ *Ticket #{ticket_id} Resolved!*\n\n"
+        f"Aapki problem solve ho gayi. "
+        f"Aur help ke liye /support karein.",
+        parse_mode='Markdown')
+    bot.edit_message_text(
+        call.message.text + "\n\n✅ *RESOLVED*",
+        call.message.chat.id, call.message.message_id,
+        parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "support_cancel")
+def callback_support_cancel(call):
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text("❌ Cancelled", call.message.chat.id, call.message.message_id)
+
 def process_handle_setting(msg):
     """Admin input handle karne ke liye jo Support ya Channel badalta hai"""
     try:
@@ -1484,7 +1828,9 @@ def process_handle_setting(msg):
             return bot.reply_to(msg, "❌ Invalid Format! Use `TYPE | VALUE`")
         parts = [p.strip() for p in msg.text.split("|")]
         # Proper Cleanup: Remove @ and backslashes in one go
-        h_type, value = parts[0].upper(), parts[1].replace("@", "").replace("\\", "").strip()
+        h_type = parts[0].upper()
+        value = parts[1].replace("@", "").replace("\\", "").strip()
+        
         if h_type == "SUPPORT":
             db.db_set_setting('SUPPORT_HANDLE', value)
             bot.reply_to(msg, f"✅ Support handle updated to: @{value}")
@@ -1494,52 +1840,88 @@ def process_handle_setting(msg):
         elif h_type == "PAYMENT_ID":
             db.db_set_setting('PAYMENT_CHANNEL_ID', value)
             bot.reply_to(msg, f"✅ Payment Verification Channel ID updated to: {value}")
+        elif h_type == "SUPPORT_ID":
+            db.db_set_setting('SUPPORT_CHANNEL_ID', value)
+            bot.reply_to(msg, f"✅ Support Ticket Channel ID updated to: {value}")
         else:
-            bot.reply_to(msg, "❌ Invalid Type! Use `SUPPORT`, `CHANNEL`, or `PAYMENT_ID`.")
+            bot.reply_to(msg, "❌ Invalid Type! Use `SUPPORT`, `CHANNEL`, `PAYMENT_ID`, or `SUPPORT_ID`.")
     except:
         bot.reply_to(msg, "❌ Error! Format: `TYPE | HANDLE`")
 
 @bot.message_handler(commands=['rules'])
 def cmd_rules(msg):
     """Users ko scoring system samjhane ke liye"""
-    rules = (
-        "📊 *CRICKTEAM11 SCORING SYSTEM*\n\n"
-        "🏏 Run: +1 | 4s: +4 | 6s: +6\n"
-        "⚽ Wicket: +25 | Maiden: +10\n"
-        "👑 C: 2x | VC: 1.5x\n\n"
-        "🚫 *Match Lock:* Match start hone par team edit nahi hogi.\n"
-        f"🏧 *Withdrawal:* Minimum ₹{MIN_WITHDRAWAL}"
-    )
+    rules = f"""
+📊 *SCORING*
+🏏 Run: 1 | 4s: +4 | 6s: +6
+⚾ Wkt: +25 | Maiden: +10
+👑 Multiplier: C: 2x | VC: 1.5x
+🚫 Lock: Match start hone par.
+"""
     bot.send_message(msg.chat.id, rules, parse_mode='Markdown')
 
 # ===================================================
-# DEBUG COMMANDS
+# FEATURE 5: Live Rank During Match
 # ===================================================
-
-@bot.message_handler(commands=['test_sync'])
-def cmd_test_sync(msg):
-    """Google Sheets connection verify karne ke liye"""
-    if str(msg.from_user.id) != ADMIN_ID:
-        return
-    sent = bot.reply_to(msg, "🔍 *Testing Google Sheets connection...*", parse_mode='Markdown')
+@bot.message_handler(commands=['myrank'])
+def cmd_myrank(msg):
+    # Brand new function
+    uid = str(msg.from_user.id)
     
-    sh = sheets.init_sheets()
-    if sh:
-        try:
-            # Try to fetch worksheet titles to verify read access
-            worksheets = sh.worksheets()
-            titles = [w.title for w in worksheets]
-            success_text = (
-                "✅ *Google Sheets Connection Successful!*\n\n"
-                f"📊 *Spreadsheet:* {sh.title}\n"
-                f"📋 *Worksheets found:* {', '.join(titles)}\n\n"
-                "System ab data sync karne ke liye taiyar hai."
-            )
-            bot.edit_message_text(success_text, msg.chat.id, sent.message_id, parse_mode='Markdown')
-        except Exception as e:
-            bot.edit_message_text(f"❌ *API Connected but Sheet Access Denied:*\n`{str(e)}`", msg.chat.id, sent.message_id, parse_mode='Markdown')
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for mid, info in MATCHES.items():
+        if is_match_locked(mid):
+            markup.add(types.InlineKeyboardButton(
+                f"📊 {info['name']}", 
+                callback_data=f"show_rank_{mid}"))
+    
+    if not markup.keyboard:
+        bot.send_message(msg.chat.id,
+            "⏳ *Abhi koi match live nahi hai!*\n\n"
+            "Match start hone ke baad /myrank karein.",
+            parse_mode='Markdown')
+        return
+    
+    bot.send_message(msg.chat.id,
+        "📊 *LIVE RANK*\nKaunse match ka rank dekhna hai?",
+        reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_rank_"))
+def callback_show_rank(call):
+    uid = str(call.from_user.id)
+    mid = call.data.split("_")[2]
+    
+    rank_data = db.db_get_user_rank(uid, mid)
+    total = db.db_get_match_participant_count(mid)
+    
+    # Get user's teams for this match
+    teams_text = ""
+    for i in range(1, 4): # Assuming max 3 teams for simplicity in display
+        t = db_get_team(uid, mid, i)
+        if t and t.get('is_paid'):
+            pts = t.get('points', 0)
+            teams_text += f"Team {i}: {pts} pts\n"
+    
+    if not rank_data:
+        text = (
+            "❌ *Is match mein join nahi kiya!*\n\n"
+            "Paid contest mein hote to rank dikhta."
+        )
     else:
-        bot.edit_message_text("❌ *Failed to Initialize:* Check Render logs for 'GSheets Init Error'. JSON format galat ho sakta hai.", msg.chat.id, sent.message_id, parse_mode='Markdown')
+        rank = rank_data['rank']
+        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
+        text = (
+            f"📊 *LIVE RANK — {MATCHES[mid]['name']}*\n\n"
+            f"Aapka Rank: *{medal} / {total}*\n\n"
+            f"{teams_text}\n"
+            f"🔄 Points update hote rehte hain\n"
+            f"_/myrank dobara karein latest rank ke liye_"
+        )
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"show_rank_{mid}"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         reply_markup=markup, parse_mode='Markdown')
 
 # ===================================================
 # CALLBACKS
@@ -1553,6 +1935,16 @@ def callback_handler(call):
 def callback_app_home(call):
     bot.answer_callback_query(call.id)
     start_command(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "app_wallet")
+def callback_app_wallet(call):
+    bot.answer_callback_query(call.id)
+    cmd_wallet(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "app_myrank")
+def callback_app_myrank(call):
+    bot.answer_callback_query(call.id)
+    cmd_myrank(call.message)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_player_stats_"))
 def callback_show_player_stats(call):
@@ -1571,19 +1963,97 @@ def callback_show_player_stats(call):
     markup, text = ui.player_stats_render(match_id, match_name, player_stats, scoring.POINT_SYSTEM)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
+def send_onboarding_step1(chat_id, first_name):
+    """Step 1: Welcome + How it works"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ Next: Team Kaise Banate Hain", callback_data="onboard_step2"))
+    
+    bot.send_message(chat_id,
+        f"🏏 *Welcome {first_name}! Chaliye shuru karte hain!*\n\n"
+        f"*Yeh bot kya karta hai?*\n\n"
+        f"1️⃣ Aap cricket players choose karte ho\n"
+        f"2️⃣ Contest mein entry lete ho\n"
+        f"3️⃣ Real match ke hisaab se points milte hain\n"
+        f"4️⃣ Top rank pe prize milta hai! 💰\n\n"
+        f"*Step 1/3 — Basics samajh liye!*",
+        reply_markup=markup, parse_mode='Markdown')
+
+def send_onboarding_step2(chat_id):
+    """Step 2: Team building guide"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ Next: Scoring & Prizes", callback_data="onboard_step3"))
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="onboard_step1_back"))
+    
+    bot.send_message(chat_id,
+        f"🧑‍💼 *Team Kaise Banate Hain?*\n\n"
+        f"✅ 11 players chunte hain:\n"
+        f"• 3-6 Batsmen 🏏\n"
+        f"• 1-4 Wicketkeepers 🧤\n"
+        f"• 1-4 All-rounders ⭐\n"
+        f"• 3-6 Bowlers 🎯\n\n"
+        f"👑 *Captain = 2x Points*\n"
+        f"⭐ *Vice Captain = 1.5x Points*\n\n"
+        f"_Sahi C/VC choose karna sabse zaroori hai!_\n\n"
+        f"*Step 2/3*",
+        reply_markup=markup, parse_mode='Markdown')
+
+def send_onboarding_step3(chat_id):
+    """Step 3: Prizes + CTA"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🏏 APNI PEHLI TEAM BANAO!", callback_data="cmd_my_team_nav"))
+    markup.add(types.InlineKeyboardButton("🏆 CONTESTS DEKHO", callback_data="contest_list"))
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="onboard_step2_back"))
+    
+    bot.send_message(chat_id,
+        f"🏆 *Prizes Kaise Milte Hain?*\n\n"
+        f"🥇 Rank #1 → ₹2000\n"
+        f"🥈 Rank #2 → ₹800\n"
+        f"🥉 Rank #3 → ₹400\n\n"
+        f"💰 *Min Withdrawal: ₹{MIN_WITHDRAWAL}*\n"
+        f"⚡ *UPI pe instant payout*\n\n"
+        f"🎁 *Refer & Earn:* Dost ko refer karo\n"
+        f"   → Unke pehle contest pe ₹10 bonus!\n\n"
+        f"*Step 3/3 — Ab shuru karo!* 🚀",
+        reply_markup=markup, parse_mode='Markdown')
+
+# Onboarding callbacks
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step2")
+def callback_onboard_step2(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step2(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step3")
+def callback_onboard_step3(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step3(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step1_back")
+def callback_onboard_back1(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step1(call.message.chat.id, call.from_user.first_name)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step2_back")
+def callback_onboard_back2(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step2(call.message.chat.id)
+
 def handle_selection(call):
+    # FIX 4: Rate Limiting
     uid = str(call.from_user.id)
+    now = time.time()
+    if now - _selection_cooldown.get(uid, 0) < 0.5:
+        bot.answer_callback_query(call.id, "⚡ Thoda ruko...")
+        return
+    _selection_cooldown[uid] = now
+
     parts = call.data.split("_")
     match_id, team_num, role = parts[1], int(parts[2]), parts[3]
     player_name = " ".join(parts[4:])
     cache_key = (uid, match_id, team_num)
 
     if is_match_locked(match_id):
-        bot.answer_callback_query(call.id, "🚫 Match is Locked!", show_alert=True)
+        bot.answer_callback_query(call.id, "🚫 Match lock ho chuka hai!", show_alert=True)
         return
-
-    # Answer immediately with NO text to make the interface feel instant
-    bot.answer_callback_query(call.id)
 
     # ⚡ CACHE UPDATE ONLY - NO DATABASE WRITE
     team = db_get_team(uid, match_id, team_num) # Hydrates cache if empty
@@ -1591,18 +2061,23 @@ def handle_selection(call):
     
     selected = team.get(role, [])
     _, role_max = ROLE_LIMITS[role]
+    total = get_total_players(team)
 
     if player_name in selected:
         selected.remove(player_name)
+        bot.answer_callback_query(call.id, f"❌ {player_name} removed!")
     else:
-        if role != 'sub' and get_total_players(team) >= 11:
+        if role != 'sub' and total >= 11:
+            bot.answer_callback_query(call.id, "⚠️ Squad full! (Max 11 Players)", show_alert=True)
             return
 
         if len(selected) >= role_max:
+            bot.answer_callback_query(call.id, f"⚠️ {ROLE_NAMES[role]} ki limit {role_max} hai!", show_alert=True)
             return
         selected.append(player_name)
+        bot.answer_callback_query(call.id, f"✅ {player_name} added!")
 
-    # Update memory cache
+    # FIX 3: Persistence for selection
     temp_team_cache[cache_key] = team
     # Refresh UI instantly
     show_player_selection(call.message.chat.id, uid, role, match_id, team_num, call.message.message_id)
@@ -1618,6 +2093,52 @@ def callback_catchall(call):
         admin_app.handle_admin_nav(call, bot)
         return
         
+    # Route Match Management Callbacks
+    if call.data.startswith("adm_m_"):
+        if not is_admin(call.from_user.id): return
+        parts = call.data.split("_")
+        action, mid = parts[2], parts[3]
+        
+        if action == "add":
+            sent = bot.send_message(call.message.chat.id, 
+                f"👤 *ADD PLAYERS TO {mid}*\n\nFormat: `player_name | role`\nMultiple lines use karein.\n\nRoles: `bat, wk, ar, bowl, sub`", 
+                parse_mode='Markdown', reply_markup=types.ForceReply())
+            bot.register_next_step_handler(sent, process_player_addition)
+            
+        elif action == "view":
+            # Re-using the list_players logic
+            call.message.text = f"/list_players {mid}"
+            cmd_list_players(call.message)
+            
+        elif action == "del":
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("✅ CONFIRM DELETE", callback_data=f"adm_m_realdel_{mid}"),
+                types.InlineKeyboardButton("❌ CANCEL", callback_data="app_home")
+            )
+            bot.edit_message_text(f"⚠️ *ARE YOU SURE?*\n\nMatch `{mid}` delete karne se sabhi teams aur data chala jayega!", 
+                                 call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+                                 
+        elif action == "realdel":
+            try:
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM MATCHES_LIST WHERE match_id=%s", (mid,))
+                    conn.execute("DELETE FROM PLAYERS WHERE match_id=%s", (mid,))
+                    conn.execute("DELETE FROM TEAMS WHERE match_id=%s", (mid,))
+                MATCHES.pop(mid, None)
+                PLAYERS_CACHE.pop(mid, None)
+                bot.edit_message_text(f"✅ Match `{mid}` and all related data deleted successfully.", 
+                                     call.message.chat.id, call.message.message_id)
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"Error: {e}", show_alert=True)
+        
+        bot.answer_callback_query(call.id)
+        return
+
+    # PATCH: /help command support button handler
+    if call.data == "start_support":
+        cmd_support(call.message)
+        return
     # Route Scoring events
     if call.data.startswith("evt_"):
         parts = call.data.split("_")
@@ -1710,22 +2231,34 @@ def cmd_broadcast(msg):
 def process_broadcast_message(msg):
     if not is_admin(msg.from_user.id):
         return
-    
-    broadcast_text = msg.text
-    if not broadcast_text:
+
+    # 📸 Support for Photo Broadcasts
+    is_photo = msg.content_type == 'photo'
+    file_id = msg.photo[-1].file_id if is_photo else None
+    caption_or_text = msg.caption if is_photo else msg.text
+
+    broadcast_text = sanitize_input(caption_or_text, 4000)
+    if not broadcast_text and not is_photo:
         bot.send_message(ADMIN_ID, "❌ Broadcast message cannot be empty.")
         return
 
     bot.send_message(ADMIN_ID, "🚀 Starting broadcast... This may take a while.")
     
+    my_id = str(bot.get_me().id)
     success_count = 0
     fail_count = 0
     with db.get_db() as conn:
         conn.execute("SELECT user_id FROM USERS")
         users = conn.fetchall()
         for user_row in users:
+            # Skip the bot itself if its ID is in the database
+            if str(user_row['user_id']) == my_id:
+                continue
             try:
-                bot.send_message(user_row['user_id'], broadcast_text, parse_mode='Markdown')
+                if is_photo:
+                    bot.send_photo(user_row['user_id'], file_id, caption=broadcast_text, parse_mode='Markdown')
+                else:
+                    bot.send_message(user_row['user_id'], broadcast_text, parse_mode='Markdown')
                 success_count += 1
                 time.sleep(0.05) # Small delay to avoid hitting Telegram API limits
             except telebot.apihelper.ApiTelegramException as e:
@@ -1733,6 +2266,56 @@ def process_broadcast_message(msg):
                 fail_count += 1
     
     bot.send_message(ADMIN_ID, f"✅ Broadcast finished!\n\nSent to {success_count} users.\nFailed for {fail_count} users (likely blocked the bot).")
+
+def send_prematch_reminders():
+    """Checks for upcoming matches and notifies users who haven't joined yet"""
+    now = get_now()
+    for mid, info in MATCHES.items():
+        deadline = info['deadline']
+        time_to_match = deadline - now
+        
+        # Match starts in 30-45 minutes
+        if timedelta(minutes=30) <= time_to_match <= timedelta(minutes=45):
+            # 1. Users with NO team saved
+            users_no_team = db.db_get_users_without_team(mid)
+            for uid in users_no_team:
+                if not db.db_was_reminder_sent(mid, uid, 'prematch'):
+                    try:
+                        bot.send_message(uid, f"🏏 *Match Starting Soon!* ⏳\n\n`{info['name']}` ka deadline 30 min mein hai. Jaldi apni team banayein aur join karein!", parse_mode='Markdown')
+                        db.db_mark_reminder_sent(mid, uid, 'prematch')
+                    except: pass
+            
+            # 2. Users with saved but UNPAID teams
+            users_unpaid = db.db_get_users_unpaid_team(mid)
+            for uid in users_unpaid:
+                if not db.db_was_reminder_sent(mid, uid, 'unpaid_team'):
+                    try:
+                        bot.send_message(uid, f"⚠️ *Team Not Joined!*\n\nAapne `{info['name']}` ke liye team banayi hai par contest join nahi kiya. Deadline se pehle join karein!", parse_mode='Markdown')
+                        db.db_mark_reminder_sent(mid, uid, 'unpaid_team')
+                    except: pass
+
+# ===================================================
+# FEATURE 3: Re-engagement Notification (3 Day Inactive)
+# ===================================================
+def send_reengagement_notifications():
+    """Sends re-engagement messages to inactive users."""
+    inactive_users = db.db_get_inactive_users(days=3)
+    for user in inactive_users:
+        uid = user['user_id']
+        first_name = user['first_name']
+        try:
+            text = (
+                f"👋 *Hey {first_name}, wapas aao!* 👋\n\n"
+                "Aapko miss kar rahe hain! Naye matches aur bade prizes aapka intezaar kar rahe hain.\n\n"
+                "Jaldi se bot par wapas aao aur apni team banao! 🏏"
+            )
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🏆 CONTESTS DEKHO", callback_data="contest_list"))
+            bot.send_message(uid, text, reply_markup=markup, parse_mode='Markdown')
+            db.db_mark_reminder_sent(None, uid, 'reengagement') # match_id is None for re-engagement
+            time.sleep(0.05)
+        except Exception as e:
+            logging.warning(f"Failed to send re-engagement to {uid}: {e}")
 
 # ===================================================
 # POINTS CALCULATION SYSTEM
@@ -1750,6 +2333,8 @@ def calculate_all_points(match_id, player_scores):
             teams_rows = conn.fetchall()
             results = []
             
+            configs = {cfg['entry_fee']: cfg for cfg in db.db_get_all_contest_configs(match_id)}
+
             for row in teams_rows:
                 uid = row['user_id']
                 team_data = json.loads(row['team_players'])
@@ -1773,12 +2358,26 @@ def calculate_all_points(match_id, player_scores):
                 conn.execute("UPDATE TEAMS SET points = %s WHERE user_id = %s AND match_id = %s AND team_num = %s", (total_pts, uid, row['match_id'], row['team_num']))
                 results.append({'user_id': uid, 'points': total_pts})
             
-            # Ranking calculate karein (Sorted by points)
+            # ADD 5: Prize Auto-Credit
             results.sort(key=lambda x: x['points'], reverse=True)
             
             for index, res in enumerate(results):
                 rank = index + 1
-                prize = "₹2000" if rank == 1 else "₹800" if rank == 2 else "₹400" if rank == 3 else "₹0"
+                
+                # Logic to determine prize from db config (simplified here)
+                prize_amt = 0
+                prize_text = "₹0"
+                if rank == 1: prize_amt = 2000
+                elif rank == 2: prize_amt = 800
+                elif rank == 3: prize_amt = 400
+                
+                if prize_amt > 0:
+                    prize_text = f"₹{prize_amt}"
+                    ref_id = f"PRIZE_{match_id}_{rank}_{res['user_id']}"
+                    process_payment_success(res['user_id'], prize_amt, ref_id, conn=conn)
+                    bot.send_message(res['user_id'], f"🎊 *Winner!*\nAapne Match `{match_id}` mein #{rank} rank hasil kiya! ₹{prize_amt} credit ho gaye hain.")
+                else:
+                    bot.send_message(res['user_id'], f"📉 Match `{match_id}` ended. Aapka rank #{rank} raha. Better luck next time!")
                 
                 # Results Sheet mein sync karein
                 sheets.sync_wrapper({
@@ -1786,12 +2385,12 @@ def calculate_all_points(match_id, player_scores):
                     "user_id": res['user_id'],
                     "points": res['points'],
                     "rank": rank,
-                    "prize": prize
+                    "prize": prize_text
                 }, "RESULTS")
                 
                 # Notify User (Optional: only for top ranks to avoid spam)
                 if rank <= 3:
-                    bot.send_message(res['user_id'], f"🎊 *CONGRATS!*\n\nAapka rank *#{rank}* hai with *{res['points']}* points!\nPrize: {prize}\n\n📸 *Note:* Payout hote hi payment ka screenshot yahi share kiya jayega.", parse_mode='Markdown')
+                    bot.send_message(res['user_id'], f"🎊 *CONGRATS!*\n\nAapka rank *#{rank}* hai with *{res['points']}* points!\nPrize: {prize_text}\n\n📸 *Note:* Payout hote hi payment ka screenshot yahi share kiya jayega.", parse_mode='Markdown')
                 
         return True
     except Exception as e:
@@ -1804,9 +2403,9 @@ def cmd_add_match(msg):
     text = (
         "🆕 *ADD NEW MATCH*\n\n"
         "Niche diye gaye format mein details bhejein:\n"
-        "`ID | Name | Type | YYYY-MM-DD HH:MM`\n\n"
+        "`match_id | Name | Type | YYYY-MM-DD HH:MM`\n\n"
         "Example:\n"
-        "`m5 | RR vs PBKS | IPL T20 | 2026-04-24 19:30`"
+        "`m1 | CSK vs MI | IPL T20 | 2026-05-01 19:30`"
     )
     sent = bot.send_message(msg.chat.id, text, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_match_input)
@@ -1826,39 +2425,57 @@ def process_match_input(msg):
         db.db_add_match(mid, name, m_type, deadline_str)
         PLAYERS_CACHE.pop(mid, None) # Clear cache for this match
         sync_matches_from_db() # Refresh memory cache
-        
-        bot.reply_to(msg, f"✅ *Match Added Successfully!*\n\n🏏 {name}\n⏰ Deadline: {deadline_str}\n\n⚠️ *Note:* Ab `/add_player` command use karke players add karein.")
+        uid = str(msg.from_user.id)
+        ADMIN_MATCH_CONTEXT[uid] = mid # Remember match context
+        ADMIN_MATCH_CONTEXT[uid + "_wizard"] = True # Start setup wizard
+
+        bot.reply_to(msg, f"✅ *Match Added: {name}*\n\nAb is match ke liye *Players* bhein (Har line pe ek):\n`Name | role` (e.g. `Virat Kohli | bat`)", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_player_addition)
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}\nFormat check karein: `YYYY-MM-DD HH:MM`")
 
 @bot.message_handler(commands=['add_player'])
 def cmd_add_player(msg):
     if not is_admin(msg.from_user.id): return
+    active_mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id), "m1")
     help_text = (
-        "👤 *ADD NEW PLAYER*\n\n"
-        "Format: `match_id | player_name | role`\n"
-        "Roles: `bat, wk, ar, bowl, sub`\n\n"
-        "Example: `m3 | Rohit Sharma | bat`"
-        "\n\n*Multiple players add karne ke liye, har player ko nayi line mein likhein:*\n"
-        "`m5 | Player1 | bat\nm5 | Player2 | bowl\nm5 | Player3 | wk`"
+        "👤 *QUICK ADD PLAYER*\n\n"
+        "👉 *Format 1 (Bulk):*\n"
+        f"`{active_mid}` (Pehli line)\n"
+        "`Player Name | role` (Baaki lines)\n\n"
+        "👉 *Format 2 (Single):*\n"
+        f"`{active_mid} | Name | role`\n\n"
+        "Roles: `bat, wk, ar, bowl, sub`"
     )
     sent = bot.send_message(msg.chat.id, help_text, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_player_addition)
 
 def process_player_addition(msg):
     if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
     try:
         lines = msg.text.strip().split('\n')
         added_players = []
         failed_players = []
         
+        # Smart Detection: If first line is just a match_id
+        default_mid = ADMIN_MATCH_CONTEXT.get(uid)
+        if len(lines) > 1 and "|" not in lines[0]:
+            default_mid = lines[0].strip()
+            lines = lines[1:]
+            ADMIN_MATCH_CONTEXT[uid] = default_mid # Update context
+        
         for line in lines:
             parts = [p.strip() for p in line.split("|")]
-            if len(parts) < 3:
-                failed_players.append(f"❌ Format galat: `{line}`")
+            
+            if len(parts) == 3: # Format: mid | name | role
+                mid, name, role = parts[0], parts[1], parts[2].lower()
+            elif len(parts) == 2 and default_mid: # Format: name | role
+                mid, name, role = default_mid, parts[0], parts[1].lower()
+            else:
+                failed_players.append(f"❌ Format error: `{line}`")
                 continue
-                
-            mid, name, role = parts[0], parts[1], parts[2].lower()
+
             if role not in ROLES:
                 failed_players.append(f"❌ Galat role `{role}`: `{name}`")
                 continue
@@ -1880,8 +2497,87 @@ def process_player_addition(msg):
             response_text += "\n\n*Nahi huye:*\n" + "\n".join(failed_players)
             
         bot.send_message(msg.chat.id, response_text, parse_mode='Markdown')
+
+        # Wizard Flow: Check if we should proceed to contest setup
+        if ADMIN_MATCH_CONTEXT.get(uid + "_wizard"):
+            bot.send_message(msg.chat.id, "✅ *Players Sync Ho Gaye!*\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots | comm%` (e.g. `100 | 50 | 10`)", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, process_mega_setup)
+
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}")
+
+def process_mega_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        comm = int(parts[2]) if len(parts) > 2 else None
+        
+        db.db_set_contest_config(mid, fee, slots)
+        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
+        
+        txt = (f"✅ *MEGA Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
+               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
+               f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots`) ya `skip` likhein:")
+        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`)")
+        bot.register_next_step_handler(msg, process_mega_setup)
+
+def process_medium_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Medium skipped. Ab **🥉 SMALL Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        comm = int(parts[2]) if len(parts) > 2 else None
+
+        db.db_set_contest_config(mid, fee, slots)
+        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
+        
+        txt = (f"✅ *MEDIUM Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
+               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
+               f"Ab **🥉 SMALL Contest** details bhein (`fee | slots`) ya `skip` likhein:")
+        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`)")
+        bot.register_next_step_handler(msg, process_medium_setup)
+
+def process_small_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    ADMIN_MATCH_CONTEXT.pop(uid + "_wizard", None) # Wizard complete
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "✅ *Match Setup Complete!* Sabhi updates live hain.")
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        db.db_set_contest_config(mid, fee, slots)
+        bot.send_message(msg.chat.id, "✅ *SMALL Contest Set!*\n\n🚀 *Match Setup Complete!* Match ab users ke liye dashboard par live hai.")
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`)")
+        bot.register_next_step_handler(msg, process_small_setup)
 
 @bot.message_handler(commands=['list_players'])
 def cmd_list_players(msg):
@@ -1892,6 +2588,7 @@ def cmd_list_players(msg):
         return
         
     mid = parts[1]
+    ADMIN_MATCH_CONTEXT[str(msg.from_user.id)] = mid # Remember this match
     players = get_players(mid)
     
     text = f"📋 *PLAYER LIST - {mid}*\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -1906,6 +2603,64 @@ def cmd_list_players(msg):
         text = f"❌ No players found for match ID: `{mid}`"
         
     bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['my_matches'])
+def cmd_my_matches(msg):
+    """F10: Admin command to view and manage all matches in the system"""
+    if not is_admin(msg.from_user.id): return
+    
+    if not MATCHES:
+        bot.send_message(msg.chat.id, "❌ No matches found in system.")
+        return
+
+    bot.send_message(msg.chat.id, "📋 *ALL MATCHES*", parse_mode='Markdown')
+    now = get_now()
+    
+    for mid, info in MATCHES.items():
+        deadline = info['deadline']
+        player_count = db.db_get_player_count(mid)
+        
+        # Status Logic
+        if now > deadline:
+            status = "🔒 LOCKED"
+        else:
+            delta = deadline - now
+            total_sec = delta.total_seconds()
+            
+            # Format time left string
+            if delta.days > 0:
+                time_str = f"{delta.days}d {delta.seconds//3600}h"
+            else:
+                time_str = f"{delta.seconds//3600}h {(delta.seconds//60)%60}m"
+                
+            if total_sec < 6 * 3600:
+                status = f"🟢 OPEN ({time_str} left)"
+            else:
+                status = f"🟡 UPCOMING ({time_str} left)"
+
+        count_display = f"{player_count}" + (" ⚠️" if player_count == 0 else "")
+        deadline_display = deadline.strftime('%d %b %Y • %I:%M %p')
+
+        match_text = (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 ID: `{mid}`\n"
+            f"🏏 Match: *{info['name']}*\n"
+            f"📅 Type: {info['type']}\n"
+            f"⏰ Deadline: {deadline_display}\n"
+            f"⌛ Status: {status}\n"
+            f"👥 Players Added: {count_display}\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("➕ Add Players", callback_data=f"adm_m_add_{mid}"),
+            types.InlineKeyboardButton("👥 View Players", callback_data=f"adm_m_view_{mid}"),
+            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"adm_m_del_{mid}")
+        )
+        bot.send_message(msg.chat.id, match_text, reply_markup=markup, parse_mode='Markdown')
+
+    bot.send_message(msg.chat.id, f"Total: {len(MATCHES)} matches")
 
 @bot.message_handler(commands=['delete_player'])
 def cmd_delete_player(msg):
@@ -1934,24 +2689,38 @@ def process_player_deletion(msg):
 
 @bot.message_handler(commands=['update_points', 'up'])
 def cmd_update_points(msg):
-    """Short Method: /up m1 | Player1:10, Player2:20"""
+    """
+    Fast Update:
+    1. /up Kohli 50 (Uses active match)
+    2. /up m1 Kohli 50
+    3. /up m1 | Kohli:50, Rohit:20 (Bulk)
+    """
     if not is_admin(msg.from_user.id):
         return
 
+    uid = str(msg.from_user.id)
+    text = msg.text.replace('/update_points', '').replace('/up', '').strip()
+    
+    if not text:
+        bot.reply_to(msg, "⚡ *Quick Update:* `/up PlayerName Score` (e.g. `/up Kohli 50`)", parse_mode='Markdown')
+        return
+
     try:
-        input_data = msg.text.split(maxsplit=1)[1]
-        if "|" not in input_data:
-            bot.reply_to(msg, "⚠️ Use: `/up match_id | P1:10, P2:20`")
-            return
-            
-        mid_part, scores_part = input_data.split("|")
-        mid = mid_part.strip()
-        
-        if mid not in MATCHES:
-            bot.reply_to(msg, f"❌ Match ID `{mid}` valid nahi hai! Pehle match check karein.")
-            return
-            
-        scores = {p.split(':')[0].strip(): float(p.split(':')[1].strip()) for p in scores_part.split(',')}
+        if "|" in text: # Bulk format
+            mid_part, scores_part = text.split("|")
+            mid = mid_part.strip()
+            scores = {p.split(':')[0].strip(): float(p.split(':')[1].strip()) for p in scores_part.split(',')}
+        else: # Simple space-separated format
+            parts = text.split()
+            if parts[0] in MATCHES: # Format: /up m1 Kohli 50
+                mid = parts[0]
+                player = " ".join(parts[1:-1])
+                score = float(parts[-1])
+            else: # Format: /up Kohli 50 (Uses context)
+                mid = ADMIN_MATCH_CONTEXT.get(uid, "m1")
+                player = " ".join(parts[:-1])
+                score = float(parts[-1])
+            scores = {player: score}
         
         if calculate_all_points(mid, scores):
             bot.reply_to(msg, f"✅ Points updated for Match `{mid}`!")
@@ -1964,12 +2733,41 @@ def cmd_update_points(msg):
 # START BOT
 # ===================================================
 
-# Trigger Webhook Setup AFTER all handlers are registered
-if os.getenv('RENDER') or (WEBHOOK_HOST and len(WEBHOOK_HOST) > 10):
-    setup_webhook()
+
+def reminder_worker():
+    last_reengagement_date = None
+    while True:
+        try:
+            send_prematch_reminders()
+            # FEATURE 3: Re-engagement Notification (3 Day Inactive)
+            today = get_now().date()
+            if last_reengagement_date != today:
+                send_reengagement_notifications()
+                last_reengagement_date = today
+        except Exception as e:
+            logging.error(f"Worker error: {e}")
+        time.sleep(300)  # Har 5 minute
+
+reminder_thread = threading.Thread(target=reminder_worker, daemon=True)
+reminder_thread.start()
 
 if __name__ == "__main__":
-    # This block is only for local 'python final_bot.py' execution.
-    # Gunicorn uses the 'server' object directly and ignores this.
-    logging.info("🚀 Starting Flask dev server...")
-    server.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    if os.getenv('RENDER'):
+        logging.info("🚀 Starting in WEBHOOK mode (Production)...")
+        server.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    else:
+        logging.info("🤖 Starting in POLLING mode (Local)...")
+        logging.info("🧹 Clearing webhook for local polling...")
+        bot.remove_webhook()
+        time.sleep(1)
+        while True:
+            try:
+                bot.infinity_polling(
+                    skip_pending=True,
+                    timeout=30,
+                    long_polling_timeout=30,
+                    interval=0
+                )
+            except Exception as e:
+                logging.error(f"Polling Error: {e}")
+                time.sleep(3)
