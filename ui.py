@@ -1,6 +1,7 @@
 import time
 from datetime import datetime
 from telebot import types
+import db
 
 def get_loading_render(progress):
     fill = int(progress / 10)
@@ -48,6 +49,36 @@ def lock_screen_markup():
     markup.add(types.InlineKeyboardButton("🏠 Return Home", callback_data="app_home"))
     return markup, "🔒 *MATCH LOCKED*\n\nThe deadline has passed. Team editing is disabled. Live points are being calculated."
 
+def admin_match_finance_render(match_id, match_name, fin_data):
+    comm_pct = float(db.db_get_setting('PRIZE_COMMISSION', 10))
+    total_collection = fin_data['collection']
+    admin_cut = (total_collection * comm_pct) / 100
+    prize_pool = total_collection - admin_cut
+    
+    res = (
+        f"💰 *FINANCIAL SUMMARY: {match_name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Total Collection: `₹{total_collection}`\n"
+        f"✂️ Admin Cut ({comm_pct}%): `₹{admin_cut}`\n"
+        f"🎁 Total Prize Pool: `₹{prize_pool}`\n"
+        f"👥 Paid Entries: `{fin_data['entries']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 *PRIZE BREAKDOWN (Per Contest Type):*\n"
+    )
+    
+    for cfg in fin_data['configs']:
+        bd = get_prize_breakdown(cfg['entry_fee'], cfg['max_slots'])
+        res += (
+            f"\n📍 *Contest ₹{cfg['entry_fee']} ({cfg['max_slots']} slots):*\n"
+            f"🥇 1st: ₹{bd['1st']} | 🥈 2nd: ₹{bd['2nd']}\n"
+            f"🥉 3rd: ₹{bd['3rd']} | 🏅 4-10: ₹{bd['4-10']}\n"
+        )
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_fin_{match_id}"))
+    markup.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="adm_nav_home"))
+    return markup, res
+
 def admin_dashboard_home(stats, matches):
     markup = types.InlineKeyboardMarkup(row_width=2)
     fraud_btn_text = f"⚠️ Fraud Alerts ({stats['flagged']})" if stats['flagged'] > 0 else "⚠️ Fraud Alerts"
@@ -62,7 +93,10 @@ def admin_dashboard_home(stats, matches):
     # Add match control buttons
     markup.add(types.InlineKeyboardButton("--- Match Controls ---", callback_data="ignore_match_control_header"))
     for mid, info in matches.items():
-        markup.add(types.InlineKeyboardButton(f"🎮 Control: {info['name']}", callback_data=f"adm_ctrl_{mid}"))
+        markup.row(
+            types.InlineKeyboardButton(f"🎮 Control: {info['name']}", callback_data=f"adm_ctrl_{mid}"),
+            types.InlineKeyboardButton("💰 Finance", callback_data=f"adm_fin_{mid}")
+        )
     markup.add(types.InlineKeyboardButton("🔙 EXIT ADMIN", callback_data="app_home"))
     
     text = (
@@ -80,25 +114,39 @@ def admin_dashboard_home(stats, matches):
 def admin_help_render():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 BACK TO DASHBOARD", callback_data="adm_nav_home"))
-    text = (
-        "🛠 *ADMIN CONTROL CENTER*\n"
-        "━━━━━━━━━━━━━━\n"
-        "📌 *Essential Commands:*\n"
-        "• `/add_match` - Add new match details\n"
-        "• `/add_player` - Add players to match\n"
-        "• `/set_contest_size` - Prize pool setup\n"
-        "• `/update_points` - Live score updates\n"
-        "• `/set_handle` - Update Links (Format: `TYPE | HANDLE`)\n"
-        "• `/broadcast` - Send message to all\n"
-        "• `/download_db` - Database backup\n\n"
-        "⚖️ *System Rules:*\n"
-        "• *Scoring:* Run:1 | 4s:4 | 6s:6 | Wkt:25\n"
-        "• *Multipliers:* Captain 2x | VC 1.5x\n"
-        "• *Withdrawal:* Minimum ₹200\n"
-        "• *Fee:* 10% Platform Commission\n"
-        "━━━━━━━━━━━━━━\n"
-        "💡 _In commands ko direct chat mein type karein._"
-    )
+    
+    text = """
+🛠 *ADMIN MASTER CONTROL GUIDE*
+━━━━━━━━━━━━━━━━━━━━
+
+🏏 *MATCH SETUP & MANAGEMENT*
+• `/add_match` - Naya match create karein
+  _Ex: m1 | CSK vs MI | IPL | 2026-05-01 19:30_
+• `/add_player` - Players add karein (Active match context use hota hai)
+  _Ex: Kohli | bat_
+• `/my_matches` - Matches manage/delete karne ke liye
+• `/list_players m1` - Players list dekhne ke liye
+
+🏆 *CONTESTS & PRIZES*
+• `/set_contest_size` - Contest config set karein
+  _Ex: m1 | 100 | 50 | 10_ (fee | slots | comm%)
+• `/set_prize_config` - Global prize logic (Commission | Win% | R1 | R2 | R3)
+  _Ex: 10 | 70 | 35 | 20 | 12_
+
+📈 *LIVE SCORING (REAL-TIME)*
+• `/up` - Fast point update (Active match use karta hai)
+  _Ex: /up Kohli 50_
+• `/update_points` - Manual point update
+  _Ex: /update_points m1 | Kohli:50, Dhoni:20_
+
+💰 *FINANCE & SYSTEM SETTINGS*
+• `/match_finance m1` - Match ki kamayi aur breakdown
+• `/broadcast` - Sabhi users ko message ya photo bhein
+• `/set_handle` - Support/Channel/Channel IDs update karein
+  _Ex: SUPPORT_ID | -100123456789_
+• `/download_db` - Database backup download karein
+━━━━━━━━━━━━━━━━━━━━
+💡 _Sare commands direct chat mein type karein ya Dashboard buttons ka use karein._"""
     return markup, text
 
 def admin_funnel_render(funnel_counts):
@@ -157,48 +205,57 @@ def payment_instructions_render(order_id, amount, upi_id):
         types.InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_confirm_{order_id}"),
         types.InlineKeyboardButton("❌ CANCEL ORDER", callback_data="app_home")
     )
-    text = (
-        "💳 *SECURE PAYMENT*\n"
-        "━━━━━━━━━━━━━━\n"
-        f"🆔 ID: `{order_id}` | 💰 Amt: *₹{amount}*\n"
-        "━━━━━━━━━━━━━━\n"
-        "✅ *Steps:*\n"
-        "1. Upar di gayi UPI par pay karein.\n"
-        "2. **12-digit UTR** yahan bhein. (Fastest) ⚡\n"
-        "3. Ya screenshot upload karein. ⏳\n"
-        "━━━━━━━━━━━━━━\n"
-        "⚠️ _Expiry: 60 mins_"
-    )
+    text = f"""
+💳 *SECURE PAYMENT*
+━━━━━━━━━━━━━━
+💰 Amount: *₹{amount}*
+🆔 Order ID: `{order_id}`
+━━━━━━━━━━━━━━
+1️⃣ UPI par payment karein.
+2️⃣ **12-digit UTR** yahan bhein ⚡
+3️⃣ Ya screenshot bhein ⏳
+━━━━━━━━━━━━━━
+⚠️ Expiry: 60 mins
+"""
     return markup, text
 
 def contest_list_render(matches):
     markup = types.InlineKeyboardMarkup(row_width=1)
     now = datetime.now()
     
-    res = "🏆 *UPCOMING CONTESTS*\n━━━━━━━━━━━━━━━━━━━━\n"
+    res = "🏆 *MATCHES*\n\n👉 *Next:* Select a match to join contests\n━━━━━━━━━━━━━━━━━━━━\n"
     
     for mid, info in matches.items():
         deadline = info['deadline']
         is_locked = now > deadline
-        
+        time_left_delta = deadline - now
+
         status_icon = "🔒" if is_locked else "⏳"
-        if is_locked and (now - deadline).seconds < 14400: # 4 hours live window
-            status_icon = "🟢"
-            
-        time_str = info['deadline'].strftime('%H:%M')
-        btn_text = f"{status_icon} {info['name']} | {time_str}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"show_match_{mid}"))
+
+        day_tag = "Today" if deadline.date() == now.date() else deadline.strftime('%d %b')
+        time_str = deadline.strftime('%I:%M %p')
         
-    res += "_Select a match to view Prize Pools and Join._"
+        btn_text = f"{status_icon} {info['name']}"
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"show_match_{mid}"))
+
+    res += "\n⚠️ *No team?* \n👉 Pehle team banao niche buttons se."
     return markup, res
 
-def get_prize_breakdown(fee, slots, commission_pct=10):
+def get_prize_breakdown(fee, slots, custom_comm=None):
     """Calculates distribution where ~70% of players win"""
-    # Platform commission set to 10%
-    commission_multiplier = (100 - commission_pct) / 100
+    # Fetch dynamic settings from DB with defaults
+    comm_val = float(custom_comm) if custom_comm is not None else float(db.db_get_setting('PRIZE_COMMISSION', 10))
+    win_pct = float(db.db_get_setting('PRIZE_WINNERS_PCT', 70))
+    r1_pct = float(db.db_get_setting('PRIZE_R1_PCT', 35))
+    r2_pct = float(db.db_get_setting('PRIZE_R2_PCT', 20))
+    r3_pct = float(db.db_get_setting('PRIZE_R3_PCT', 12))
+
+    # Platform commission logic
+    commission_multiplier = (100 - comm_val) / 100
     collection = fee * slots
-    pool = int(collection * commission_multiplier) 
-    winners_count = int(slots * 0.7) # 70% winners
+    pool = int(collection * commission_multiplier)
+    commission_amt = collection - pool
+    winners_count = int(slots * (win_pct / 100)) # Custom % winners
 
     # 70% Winners Logic: 
     # Ranks 11 to (70% of slots) get their entry fee back.
@@ -211,63 +268,112 @@ def get_prize_breakdown(fee, slots, commission_pct=10):
     surplus_pool = max(100, pool - refund_total)
     
     # Distribution of surplus among Top 10
-    # (These values are relative percentages of the top pool)
-    prizes = {
-        "1st": int(surplus_pool * 0.35),
-        "2nd": int(surplus_pool * 0.20),
-        "3rd": int(surplus_pool * 0.12),
-        "4-10": int((surplus_pool * 0.33) / 7)
-    }
+    # Ranks 4-10 share the remaining surplus after Top 3
+    top3_total_pct = r1_pct + r2_pct + r3_pct
+    remaining_pct = max(0, 100 - top3_total_pct)
 
+    prizes = {
+        "1st": int(surplus_pool * (r1_pct / 100)),
+        "2nd": int(surplus_pool * (r2_pct / 100)),
+        "3rd": int(surplus_pool * (r3_pct / 100)),
+        "4-10": int((surplus_pool * (remaining_pct / 100)) / 7)
+    }
     return {
-        "pool": pool, "winners": winners_count,
+        "collection": collection, "commission_amt": commission_amt, "comm_pct": comm_val,
+        "pool": pool, "winners": winners_count, 
         "1st": prizes["1st"], "2nd": prizes["2nd"], "3rd": prizes["3rd"],
         "4-10": prizes["4-10"], "bottom": fee, "bottom_range": f"11-{winners_count}"
     }
 
-def match_dashboard_render(match_id, info, stats, user_summary, time_left, contest_configs=None):
+def prize_breakdown_render(match_id, fee, slots):
+    breakdown = get_prize_breakdown(fee, slots)
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}"))
+    
+    text = (
+        f"🏆 *PRIZE BREAKUP (₹{fee} Contest)*\n"
+        f"👥 Total Slots: {slots} | 💰 Pool: ₹{breakdown['pool']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🥇 *Rank 1:* ₹{breakdown['1st']}\n"
+        f"🥈 *Rank 2:* ₹{breakdown['2nd']}\n"
+        f"🥉 *Rank 3:* ₹{breakdown['3rd']}\n"
+        f"🏅 *Rank 4-10:* ₹{breakdown['4-10']} each\n"
+        f"🎖 *Rank {breakdown['bottom_range']}:* ₹{breakdown['bottom']} (Refund)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✨ *Total Winners:* {breakdown['winners']} (70% of slots)\n"
+        f"⚠️ _Note: Prize pool calculation slots full hone par based hai._"
+    )
+    return markup, text
+
+def match_dashboard_render(match_id, info, stats, user_summary, time_left, contest_configs=None, entry_fee=100):
     markup = types.InlineKeyboardMarkup(row_width=2)
     
-    prize_breakdown_text = ""
-    if contest_configs:
-        prize_breakdown_text = "🏆 *PRIZES:*\n"
-        for cfg in contest_configs:
-            bd = get_prize_breakdown(cfg['entry_fee'], cfg['max_slots'])
-            prize_breakdown_text += f"💰 ₹{cfg['entry_fee']} -> 🥇 ₹{bd['1st']} | 🥈 ₹{bd['2nd']} | ✅ 11-{bd['winners']}: ₹{bd['bottom']}\n"
-
-    # Contest Entry Buttons
+    deadline = info['deadline']
+    day_tag = "Today" if deadline.date() == datetime.now().date() else deadline.strftime('%d %b')
+    deadline_time = deadline.strftime('%I:%M %p')
+    
+    avail_spots = stats['max_slots'] - stats['joined']
+    
     if contest_configs:
         for cfg in contest_configs:
             fee = cfg['entry_fee']
-            markup.add(types.InlineKeyboardButton(f"🏆 Join Contest (₹{fee})", callback_data=f"join_{match_id}_{fee}"))
+            
+            # Custom labeling based on entry level
+            if fee >= 100: label = f"🥇 Mega ₹{fee}"
+            elif fee >= 50: label = f"🥈 Medium ₹{fee}"
+            else: label = f"🥉 Small ₹{fee}"
+
+            markup.row(types.InlineKeyboardButton(label, callback_data=f"join_{match_id}_{fee}"),
+                       types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_{fee}"))
     else:
-        markup.add(types.InlineKeyboardButton("🏅 Mega ₹100", callback_data=f"join_{match_id}_100"))
+        markup.row(types.InlineKeyboardButton("🏅 Join Mega ₹100", callback_data=f"join_{match_id}_100"),
+                   types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_100"))
     
-    # Logic for One-Click Join or Create
     if not user_summary['saved']:
-        markup.add(types.InlineKeyboardButton("⚾ CREATE YOUR FIRST TEAM", callback_data=f"team_slots_{match_id}_1"))
+        markup.add(types.InlineKeyboardButton("🏏 PEHLE TEAM BANAO", callback_data=f"team_slots_{match_id}_1"))
     else:
-        markup.add(types.InlineKeyboardButton("📋 My Teams / Status", callback_data=f"team_slots_{match_id}_1"))
+        markup.add(types.InlineKeyboardButton("⚾ MY TEAMS", callback_data=f"team_slots_{match_id}_1"))
 
     markup.add(
-        types.InlineKeyboardButton("🏆 Leaderboard", callback_data=f"app_match_{match_id}"),
-        types.InlineKeyboardButton("🔙 Back", callback_data="contest_list")
+        types.InlineKeyboardButton("📊 Leaderboard", callback_data=f"app_match_{match_id}"),
+        types.InlineKeyboardButton("🏏 Player Stats", callback_data=f"show_player_stats_{match_id}")
     )
+    markup.add(types.InlineKeyboardButton("🔙 Match List", callback_data="contest_list"))
 
-    # User Status Block
-    u_status = f"✅ {len(user_summary['paid'])} Paid | 📝 {len(user_summary['saved'])} Saved"
-    if user_summary['incomplete']:
-        u_status += f" | ⚠️ {len(user_summary['incomplete'])} Incomplete"
+    text = f"""
+🏏 *{info['name']}*
+📅 {day_tag} • Deadline: {deadline_time}
+⏰ Time Left: {time_left}
+━━━━━━━━━━━━━━━━━━━━
+💰 *Prize Pool: ₹{stats['prize_pool']}*
+🎯 Entry: ₹{entry_fee}
 
-    text = (
-        f"🏏 *{info['name']}*\n"
-        f"👥 Joined: `{stats['joined']}` | ⏳ `{time_left}`\n"
-        "━━━━━━━━━━━━━━\n"
-        f"{prize_breakdown_text}\n"
-        f"👤 *My Status:* {u_status}\n"
-        "━━━━━━━━━━━━━━"
-    )
+👥 {stats['joined']}/{stats['max_slots']} spots filled
+✅ {avail_spots} spots available
+━━━━━━━━━━━━━━━━━━━━
+👉 *Next: Team banao aur contest join karo!*"""
     return markup, text
+
+def player_stats_render(match_id, match_name, stats, point_system):
+    res = f"📊 *PLAYER LIVE STATS: {match_name}*\n━━━━━━━━━━━━━━━━━━━━\n"
+    if not stats:
+        res += "_No stats recorded yet. Points update as soon as events occur._"
+    else:
+        for p in stats:
+            pts = (p['runs'] * point_system.get('run', 1) + 
+                   p['fours'] * point_system.get('four', 4) + 
+                   p['sixes'] * point_system.get('six', 6) + 
+                   p['wickets'] * point_system.get('wicket', 25))
+            res += f"👤 *{p['player_name']}*\n"
+            res += f"└ {p['runs']} runs | {p['fours']}x4 | {p['sixes']}x6 | {p['wickets']} wkts\n"
+            res += f"⭐ *Points:* `{int(pts)}` \n\n"
+            
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🔄 Refresh Score", callback_data=f"show_player_stats_{match_id}"),
+        types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}")
+    )
+    return markup, res
 
 def contest_selection_render(match_id, match_name):
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -279,6 +385,32 @@ def contest_selection_render(match_id, match_name):
     )
     text = f"🏆 *{match_name}* - Contest Selection\n\nChoose an entry level to compete. Each contest has different prize pools and competition levels."
     return markup, text
+
+def team_points_breakdown_render(match_id, team_num, team_data, player_stats_map):
+    res = f"📊 *TEAM PERFORMANCE (T{team_num})*\n━━━━━━━━━━━━━━━━━━━━\n"
+    total = 0
+    for role in ['bat', 'wk', 'ar', 'bowl']:
+        p_list = team_data.get(role, [])
+        if not p_list: continue
+        res += f"\n*{role.upper()}*\n"
+        for p in p_list:
+            stats = player_stats_map.get(p, {'runs': 0, 'fours': 0, 'sixes': 0, 'wickets': 0})
+            raw_pts = (stats['runs'] * 1 + stats['fours'] * 4 + stats['sixes'] * 6 + stats['wickets'] * 25)
+            
+            mult = 1.0
+            tag = ""
+            if p == team_data.get('captain'): mult, tag = 2.0, "(C)"
+            elif p == team_data.get('vice_captain'): mult, tag = 1.5, "(VC)"
+            
+            p_final = int(raw_pts * mult)
+            total += p_final
+            res += f"👤 {p} {tag}\n"
+            res += f"└ {stats['runs']} R | {stats['wickets']} W | `{p_final} pts`\n"
+            
+    res += f"━━━━━━━━━━━━━━━━━━━━\n⭐ *Total Points: {total}*"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔙 Back to Team", callback_data=f"view_team_{match_id}_{team_num}"))
+    return markup, res
 
 def team_slot_picker_render(user_id, match_id, fee, db_helper):
     markup = types.InlineKeyboardMarkup(row_width=4)
