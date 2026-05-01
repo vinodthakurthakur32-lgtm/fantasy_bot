@@ -26,20 +26,27 @@ def admin_event_markup(match_id, players, active_role='bat', is_locked=False, st
 
     # 2. Only show players of active role
     if active_role in players:
-        for p_name in players[active_role]:
+        for p_obj in players.get(active_role, []):
+            # Clean name aur Display name ko alag kiya
+            p_name = p_obj['name']
+            p_display = p_obj['display']
             # Fetch current stats for the button label
             stats = stats_map.get(p_name, {'runs': 0, 'wickets': 0}) if stats_map else {'runs': 0, 'wickets': 0}
             stats_label = f"({stats['runs']}R, {stats['wickets']}W)"
             
             # Row 1: Player Full Name + Current Score
-            markup.row(types.InlineKeyboardButton(f"👤 {p_name} {stats_label}", callback_data="ignore"))
+            markup.row(types.InlineKeyboardButton(f"👤 {p_display} {stats_label}", callback_data="ignore"))
             # Row 2: Incremental buttons
             markup.row(
-                types.InlineKeyboardButton("+1 R", callback_data=f"evt_{match_id}_{p_name}_run_{active_role}"),
-                types.InlineKeyboardButton("+4 R", callback_data=f"evt_{match_id}_{p_name}_four_{active_role}"),
-                types.InlineKeyboardButton("+6 R", callback_data=f"evt_{match_id}_{p_name}_six_{active_role}"),
-                types.InlineKeyboardButton("+1 W", callback_data=f"evt_{match_id}_{p_name}_wicket_{active_role}")
+                types.InlineKeyboardButton("+1 R", callback_data=f"evt_{match_id}_{p_name.replace(' ', '_')}_run"),
+                types.InlineKeyboardButton("+4 R", callback_data=f"evt_{match_id}_{p_name.replace(' ', '_')}_four"),
+                types.InlineKeyboardButton("+6 R", callback_data=f"evt_{match_id}_{p_name.replace(' ', '_')}_six"),
+                types.InlineKeyboardButton("+1 W", callback_data=f"evt_{match_id}_{p_name.replace(' ', '_')}_wicket")
             )
+
+    # Match locked hai toh Result declare karne ka option dein
+    if is_locked:
+        markup.row(types.InlineKeyboardButton("🏁 DECLARE FINAL RESULT & PAY WINNERS", callback_data=f"adm_settle_{match_id}"))
 
     # Bulk Update Option
     markup.row(types.InlineKeyboardButton("📝 BULK TOTALS (Chunk Update)", callback_data=f"adm_bulk_up_{match_id}"))
@@ -122,6 +129,11 @@ def handle_admin_nav(call, bot):
             if "message is not modified" in e.description:
                 pass # Ignore if no changes were made to the UI
             else: raise e
+
+    elif nav.startswith("adm_settle_"):
+        match_id = nav.split("_")[2]
+        bot.answer_callback_query(call.id, "Settling Match & Distributing Prizes...", show_alert=True)
+        final_bot.process_match_end(match_id)
 
     elif nav == "adm_nav_help":
         bot.answer_callback_query(call.id)
