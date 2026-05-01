@@ -43,7 +43,6 @@ ROLE_LIMITS = {
 }
 ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Substitute'}
 NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
-DB_FILE = "crickteam11.db"
 MIN_WITHDRAWAL = 200
 
 # FIX 4: Selection Cooldown
@@ -320,7 +319,7 @@ def db_get_team(user_id, match_id='m1', team_num=1):
     return data
 
 def db_save_team(user_id, team_data, match_id='m1', team_num=1):
-    """Persist to SQLite and invalidate cache for consistency"""
+    """Persist to Database and invalidate cache for consistency"""
     try:
         with db.get_db() as conn:
             team_json = json.dumps({k: team_data.get(k, []) for k in ROLES})
@@ -2232,8 +2231,60 @@ def callback_catchall(call):
                 PLAYERS_CACHE.pop(mid, None)
                 bot.edit_message_text(f"✅ Match `{mid}` and all related data deleted successfully.", 
                                      call.message.chat.id, call.message.message_id)
-            except Exception as e:
+            except Exception:
                 bot.answer_callback_query(call.id, f"Error: {e}", show_alert=True)
+        
+        bot.answer_callback_query(call.id)
+        return
+
+    # Route Player & Contest Management Callbacks
+    if call.data.startswith("adm_p_"):
+        if not is_admin(call.from_user.id): return
+        parts = call.data.split("_")
+        action, mid = parts[2], parts[3]
+        ADMIN_MATCH_CONTEXT[str(call.from_user.id)] = mid
+
+        if action == "vdel":
+            # Interactive Delete Confirmation: adm_p_vdel_<mid>_<player_name>
+            name = "_".join(parts[4:]).replace('_', ' ')
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("✅ YES, DELETE", callback_data=f"adm_p_realdel_{mid}_{name.replace(' ', '_')}"),
+                types.InlineKeyboardButton("❌ NO, CANCEL", callback_data=f"adm_m_view_{mid}")
+            )
+            bot.edit_message_text(f"🗑️ *Confirm Deletion*\n\nMatch `{mid}` se player `{name}` ko delete karein?", 
+                                 call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+            bot.answer_callback_query(call.id)
+            return
+
+        elif action == "realdel":
+            # Perform the actual deletion
+            name = "_".join(parts[4:]).replace('_', ' ')
+            db.db_delete_player(mid, name)
+            PLAYERS_CACHE.pop(mid, None) # Clear cache
+            bot.answer_callback_query(call.id, f"✅ {name} removed!")
+            
+            # Refresh the squad list
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            call.message.text = f"/list_players {mid}"
+            cmd_list_players(call.message)
+            return
+
+        elif action == "edit":
+            sent = bot.send_message(call.message.chat.id, 
+                f"✏️ *EDIT PLAYER ROLE ({mid})*\n\nFormat: `Player Name | role` \nExample: `Virat Kohli | wk` \n\nRoles: `bat, wk, ar, bowl, sub`", 
+                parse_mode='Markdown', reply_markup=types.ForceReply())
+            bot.register_next_step_handler(sent, process_role_edit_callback)
+        elif action == "del":
+            sent = bot.send_message(call.message.chat.id, 
+                f"🗑️ *REMOVE PLAYER FROM {mid}*\n\nPlayer ka full name likhein (exact match):\nExample: `Virat Kohli`", 
+                parse_mode='Markdown', reply_markup=types.ForceReply())
+            bot.register_next_step_handler(sent, process_player_deletion_callback)
+        elif action == "delcont":
+             sent = bot.send_message(call.message.chat.id, 
+                f"🗑️ *DELETE CONTEST FROM {mid}*\n\nEntry Fee bhein (e.g. `100`):", 
+                parse_mode='Markdown', reply_markup=types.ForceReply())
+             bot.register_next_step_handler(sent, process_delete_contest_callback)
         
         bot.answer_callback_query(call.id)
         return
@@ -2336,15 +2387,7 @@ def cmd_admin_help(msg):
 def cmd_download_db(msg):
     if not is_admin(msg.from_user.id):
         return
-    try:
-        if os.path.exists(DB_FILE):
-            with open(DB_FILE, 'rb') as f:
-                bot.send_document(msg.chat.id, f, caption=f"📂 Database Backup: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            bot.reply_to(msg, "❌ Database file not found!")
-    except Exception as e:
-        logging.error(f"Error downloading DB: {e}")
-    bot.reply_to(msg, "📂 PostgreSQL use ho raha hai, isliye `/export_data` use karein CSV backup ke liye.")
+    bot.reply_to(msg, "📂 Aap PostgreSQL use kar rahe hain. Database backup ke liye `/export_data` command ka use karein jo CSV files generate karega.")
 
 @bot.message_handler(commands=['setup_contests'])
 def cmd_setup_contests(msg):
@@ -2385,7 +2428,7 @@ def process_mega_setup(msg):
                f"🥇 R1: ₹{bd['1st']} | 🥈 R2: ₹{bd['2nd']}\n🥉 R3: ₹{bd['3rd']} | 🏅 R4-10: ₹{bd['4-10']}\n\n"
                f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots | comm%`) ya `skip` likhein:")
         bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_medium_setup)
+        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_medium_setup)
     except Exception as e:
         bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`) or `skip`.")
         bot.register_next_step_handler(msg, process_mega_setup)
@@ -2412,10 +2455,10 @@ def process_medium_setup(msg):
                f"🥇 R1: ₹{bd['1st']} | 🥈 R2: ₹{bd['2nd']}\n🥉 R3: ₹{bd['3rd']} | 🏅 R4-10: ₹{bd['4-10']}\n\n"
                f"Ab **🥉 SMALL Contest** details bhein (`fee | slots | comm%`) ya `skip` likhein:")
         bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_small_setup)
-    except:
+        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_small_setup)
+    except Exception:
         bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`) or `skip`.")
-        bot.register_next_step_handler(msg, process_medium_setup)
+        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_medium_setup)
 
 def process_small_setup(msg):
     if not is_admin(msg.from_user.id): return
@@ -2439,9 +2482,9 @@ def process_small_setup(msg):
                f"🚀 *Match Setup Complete!* Match ab live hai.")
         
         bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-    except:
+    except Exception:
         bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`) or `skip`.")
-        bot.register_next_step_handler(msg, process_small_setup)
+        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_small_setup)
 
 @bot.message_handler(commands=['export_data'])
 def cmd_export_data(msg):
@@ -2933,26 +2976,36 @@ def process_small_setup(msg):
 def cmd_list_players(msg):
     if not is_admin(msg.from_user.id): return
     parts = msg.text.split()
-    if len(parts) < 2:
-        bot.reply_to(msg, "Usage: `/list_players m1`", parse_mode='Markdown')
-        return
-        
-    mid = parts[1]
-    ADMIN_MATCH_CONTEXT[str(msg.from_user.id)] = mid # Remember this match
-    players = get_players(mid)
+    mid = parts[1] if len(parts) > 1 else ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id), "m1")
     
-    text = f"📋 *PLAYER LIST - {mid}*\n━━━━━━━━━━━━━━━━━━━━\n"
+    ADMIN_MATCH_CONTEXT[str(msg.from_user.id)] = mid 
+    players_data = get_players(mid)
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    text = f"👥 *INTERACTIVE SQUAD: {mid}*\n\nPlayer par tap karein use delete karne ke liye:\n━━━━━━━━━━━━━━━━━━━━"
+    
     found = False
     for role in ROLES:
-        p_list = players.get(role, [])
+        p_list = players_data.get(role, [])
         if p_list:
             found = True
-            text += f"\n*{ROLE_NAMES[role].upper()}:*\n• " + "\n• ".join(p_list) + "\n"
+            markup.add(types.InlineKeyboardButton(f"🔹 {ROLE_NAMES[role].upper()} 🔹", callback_data="ignore"))
+            row = []
+            for p in p_list:
+                # Extract name without team: "Virat Kohli (RCB)" -> "Virat Kohli"
+                name_only = p.split(' (')[0]
+                row.append(types.InlineKeyboardButton(f"🗑️ {p}", callback_data=f"adm_p_vdel_{mid}_{name_only.replace(' ', '_')}"))
+                if len(row) == 2:
+                    markup.row(*row)
+                    row = []
+            if row: markup.row(*row)
             
     if not found:
-        text = f"❌ No players found for match ID: `{mid}`"
-        
-    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+        bot.send_message(msg.chat.id, f"❌ Match `{mid}` mein koi players nahi mile.")
+        return
+
+    markup.add(types.InlineKeyboardButton("🔙 Back to Match Control", callback_data=f"adm_ctrl_{mid}"))
+    bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.message_handler(commands=['my_matches'])
 def cmd_my_matches(msg):
@@ -3005,8 +3058,15 @@ def cmd_my_matches(msg):
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
             types.InlineKeyboardButton("➕ Add Players", callback_data=f"adm_m_add_{mid}"),
-            types.InlineKeyboardButton("👥 View Players", callback_data=f"adm_m_view_{mid}"),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"adm_m_del_{mid}")
+            types.InlineKeyboardButton("👥 View Squad", callback_data=f"adm_m_view_{mid}")
+        )
+        markup.row(
+            types.InlineKeyboardButton("✏️ Edit Role", callback_data=f"adm_p_edit_{mid}"),
+            types.InlineKeyboardButton("❌ Remove Player", callback_data=f"adm_p_del_{mid}")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🗑️ Delete Contest", callback_data=f"adm_p_delcont_{mid}"),
+            types.InlineKeyboardButton("🔥 DELETE MATCH", callback_data=f"adm_m_del_{mid}")
         )
         bot.send_message(msg.chat.id, match_text, reply_markup=markup, parse_mode='Markdown')
 
@@ -3078,6 +3138,60 @@ def cmd_update_points(msg):
             bot.reply_to(msg, "❌ Error calculating points.")
     except Exception as e:
         bot.reply_to(msg, "⚠️ Usage: `/up m1 | Kohli:50, Rohit:20`")
+
+@bot.message_handler(commands=['edit_player_role'])
+def cmd_edit_role(msg):
+    if not is_admin(msg.from_user.id): return
+    help_text = "✏️ *EDIT PLAYER ROLE*\n\nFormat: `mid | Name | new_role` \nExample: `m1 | Rohit Sharma | bat`"
+    sent = bot.send_message(msg.chat.id, help_text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_role_edit)
+
+def process_role_edit(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, name, role = parts[0], parts[1], parts[2].lower()
+        if role in ROLES:
+            db.db_add_player(mid, name, role) # Re-uses ON CONFLICT update
+            PLAYERS_CACHE.pop(mid, None)
+            bot.reply_to(msg, f"✅ `{name}` ka role update hokar `{role.upper()}` ho gaya hai.")
+        else:
+            bot.reply_to(msg, "❌ Invalid Role!")
+    except:
+        bot.reply_to(msg, "❌ Format: `mid | Name | role` use karein.")
+
+# Helper callbacks for UI buttons
+def process_role_edit_callback(msg):
+    mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id))
+    if not mid: return
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        name, role = parts[0], parts[1].lower()
+        if role in ROLES:
+            db.db_add_player(mid, name, role)
+            PLAYERS_CACHE.pop(mid, None)
+            bot.reply_to(msg, f"✅ `{name}` ka role update hokar `{role.upper()}` ho gaya hai.")
+        else: bot.reply_to(msg, "❌ Invalid Role!")
+    except: bot.reply_to(msg, "❌ Format: `Name | role` use karein.")
+
+def process_player_deletion_callback(msg):
+    mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id))
+    if not mid: return
+    try:
+        name = msg.text.strip()
+        db.db_delete_player(mid, name)
+        PLAYERS_CACHE.pop(mid, None)
+        bot.reply_to(msg, f"🗑️ Player `{name}` removed from match `{mid}`.")
+    except: bot.reply_to(msg, "❌ Error removing player.")
+
+def process_delete_contest_callback(msg):
+    mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id))
+    if not mid: return
+    try:
+        fee = int(msg.text.strip())
+        db.db_delete_contest(mid, fee)
+        bot.reply_to(msg, f"✅ Match `{mid}` se ₹{fee} wala contest delete ho gaya!")
+    except:
+        bot.reply_to(msg, "❌ Invalid Fee! Sirf number bhein (e.g. 100)")
 
 # ===================================================
 # START BOT
