@@ -175,7 +175,9 @@ def get_players(match_id):
     for p in db_players:
         role = p.get('role', '').lower()
         if role in formatted_data:
-            formatted_data[role].append(p['player_name'])
+            # Player name ke saath team dikhane ke liye
+            display_name = f"{p['player_name']} ({p['team']})"
+            formatted_data[role].append(display_name)
     
     PLAYERS_CACHE[match_id] = formatted_data
     return formatted_data
@@ -2173,15 +2175,6 @@ def handle_selection(call):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_catchall(call):
-    # Route Admin commands
-    if call.data.startswith("adm_"):
-        if not is_admin(call.from_user.id):
-            bot.answer_callback_query(call.id, "🚫 Unauthorized!", show_alert=True)
-            return
-        import admin_app # Lazy import to avoid circular dependency
-        admin_app.handle_admin_nav(call, bot)
-        return
-        
     # Route Match Management Callbacks
     if call.data.startswith("adm_m_"):
         if not is_admin(call.from_user.id): return
@@ -2222,6 +2215,15 @@ def callback_catchall(call):
                 bot.answer_callback_query(call.id, f"Error: {e}", show_alert=True)
         
         bot.answer_callback_query(call.id)
+        return
+
+    # Route Admin commands
+    if call.data.startswith("adm_"):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "🚫 Unauthorized!", show_alert=True)
+            return
+        import admin_app # Lazy import to avoid circular dependency
+        admin_app.handle_admin_nav(call, bot)
         return
 
     # PATCH: /help command support button handler
@@ -2693,36 +2695,58 @@ def process_player_addition(msg):
     if not is_admin(msg.from_user.id): return
     uid = str(msg.from_user.id)
     try:
-        lines = msg.text.strip().split('\n')
+        raw_text = msg.text.strip()
+        lines = raw_text.split('\n')
         added_players = []
         failed_players = []
         
         # Smart Detection: If first line is just a match_id
         default_mid = ADMIN_MATCH_CONTEXT.get(uid)
-        if len(lines) > 1 and "|" not in lines[0]:
+        if len(lines) > 0 and "|" not in lines[0] and "," not in lines[0]:
             default_mid = lines[0].strip()
             lines = lines[1:]
             ADMIN_MATCH_CONTEXT[uid] = default_mid # Update context
+
+        # Combine remaining text and handle comma-separated horizontal format
+        remaining_text = "\n".join(lines)
+        if ',' in remaining_text:
+            entries = [item.strip() for item in remaining_text.split(',')]
+        else:
+            entries = [line.strip() for line in lines]
         
-        for line in lines:
-            parts = [p.strip() for p in line.split("|")]
+        # Shorthand mapping for easy typing
+        role_map = {
+            'w': 'wk', 'keeper': 'wk', 'keep': 'wk',
+            'ball': 'bowl', 'baller': 'bowl', 'bowler': 'bowl',
+            'all': 'ar', 'allrounder': 'ar', 'ar': 'ar',
+            'bat': 'bat', 'batsman': 'bat'
+        }
+
+        for entry in entries:
+            if not entry: continue
+            parts = [p.strip() for p in entry.split("|")]
             
-            if len(parts) == 3: # Format: mid | name | role
-                mid, name, role = parts[0], parts[1], parts[2].lower()
-            elif len(parts) == 2 and default_mid: # Format: name | role
-                mid, name, role = default_mid, parts[0], parts[1].lower()
+            if len(parts) == 4: # mid | name | role | team
+                mid, name, role, team = parts[0], parts[1], parts[2].lower(), parts[3].upper()
+            elif len(parts) == 3 and default_mid: # name | role | team
+                mid, name, role, team = default_mid, parts[0], parts[1].lower(), parts[2].upper()
+            elif len(parts) == 2 and default_mid: # name | role (Legacy)
+                mid, name, role, team = default_mid, parts[0], parts[1].lower(), "N/A"
             else:
-                failed_players.append(f"❌ Format error: `{line}`")
+                failed_players.append(f"❌ Format error: `{entry}`")
                 continue
+
+            # Apply shorthand role mapping
+            role = role_map.get(role, role)
 
             if role not in ROLES:
                 failed_players.append(f"❌ Galat role `{role}`: `{name}`")
                 continue
                 
             try:
-                db.db_add_player(mid, name, role)
+                db.db_add_player(mid, name, role, team)
                 PLAYERS_CACHE.pop(mid, None) # Invalidate cache
-                added_players.append(f"✅ {name} ({role.upper()})")
+                added_players.append(f"✅ {name} ({role.upper()} - {team})")
             except Exception as e:
                 if "unique constraint" in str(e).lower():
                     failed_players.append(f"⚠️ {name} (Pehle se hai)")
