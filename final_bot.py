@@ -65,7 +65,13 @@ TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_ID = os.getenv('ADMIN_ID', '').strip()
 
 # 2. Webhook Host detection
-WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL') or f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+raw_host = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL')
+if not raw_host and os.getenv('RENDER_SERVICE_NAME'):
+    # Render service name se underscore hatakar lowercase mein URL banayein
+    svc_name = os.getenv('RENDER_SERVICE_NAME').lower().replace('_', '-')
+    raw_host = f"https://{svc_name}.onrender.com"
+
+WEBHOOK_HOST = raw_host or ""
 
 if not TOKEN or not ADMIN_ID:
     logging.error("❌ CRITICAL: BOT_TOKEN or ADMIN_ID is missing!")
@@ -146,7 +152,8 @@ def sync_matches_from_db():
             MATCHES[m['match_id']] = {
                 'name': m['name'],
                 'type': m['type'],
-                'deadline': datetime.strptime(m['deadline'], '%Y-%m-%d %H:%M').replace(tzinfo=None)
+                'deadline': datetime.strptime(m['deadline'], '%Y-%m-%d %H:%M').replace(tzinfo=None),
+                'points_calculated': bool(m['points_calculated']) # New field
             }
         except Exception as e:
             logging.error(f"Error parsing match {m['match_id']}: {e}")
@@ -254,12 +261,13 @@ threading.Thread(target=async_sheets_sync, daemon=True).start()
 def setup_webhook():
     """Sets up the webhook for production environments"""
     if WEBHOOK_HOST and os.getenv('RENDER'):
-        clean_host = WEBHOOK_HOST.strip().strip('/')
+        # URL ko clean karein (spaces aur trailing slashes hatayein)
+        clean_host = WEBHOOK_HOST.strip().lower().rstrip('/')
         if not clean_host.startswith('http'):
             clean_host = f"https://{clean_host}"
         
         webhook_url = f"{clean_host}/bot-webhook"
-        logging.info(f"⚙️ Webhook Sync: Target URL is {webhook_url}")
+        logging.info(f"⚙️ Webhook Sync: Attempting to set URL to: {webhook_url}")
         
         try:
             current_info = bot.get_webhook_info()
@@ -2300,10 +2308,90 @@ def cmd_download_db(msg):
         logging.error(f"Error downloading DB: {e}")
     bot.reply_to(msg, "📂 PostgreSQL use ho raha hai, isliye `/export_data` use karein CSV backup ke liye.")
 
+@bot.message_handler(commands=['setup_contests'])
+def cmd_setup_contests(msg):
+    """Ek hi match ke liye teeno (Mega, Med, Small) contests set karne ka wizard"""
+    if not is_admin(msg.from_user.id): return
+    sent = bot.send_message(msg.chat.id, "🎯 *CONTEST SETUP WIZARD*\n\nMatch ID bhein jiske liye contests set karne hain (e.g. `m1`):", parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_setup_contests_start)
+
+def process_setup_contests_start(msg):
+    mid = msg.text.strip()
+    if mid not in MATCHES:
+        bot.reply_to(msg, f"❌ Match `{mid}` nahi mila! Match list check karein.")
+        return
+    uid = str(msg.from_user.id)
+    ADMIN_MATCH_CONTEXT[uid] = mid
+    bot.send_message(msg.chat.id, f"✅ Match `{mid}` selected.\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots` (e.g. `100 | 50`)", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_mega_setup)
+
+def process_mega_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        db.db_set_contest_config(mid, fee, slots)
+        bd = ui.get_prize_breakdown(fee, slots)
+        
+        txt = (f"✅ *MEGA Contest Set!*\n\n💰 Pool: ₹{bd['pool']}\n✨ Winners: {bd['winners']}\n\n"
+               f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots`) ya `skip` likhein:")
+        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+    except Exception as e:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`) or `skip`.")
+        bot.register_next_step_handler(msg, process_mega_setup)
+
+def process_medium_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Medium skipped. Ab **🥉 SMALL Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        db.db_set_contest_config(mid, fee, slots)
+        bot.send_message(msg.chat.id, f"✅ *MEDIUM Contest Set!*\n\nAb **🥉 SMALL Contest** details bhein (`fee | slots`) ya `skip` likhein:", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`) or `skip`.")
+        bot.register_next_step_handler(msg, process_medium_setup)
+
+def process_small_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "✅ *Match Setup Complete!* Sabhi updates live hain.")
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        db.db_set_contest_config(mid, fee, slots)
+        bot.send_message(msg.chat.id, "✅ *SMALL Contest Set!*\n\n🚀 *Match Setup Complete!* Match ab users ke liye dashboard par live hai.")
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`) or `skip`.")
+        bot.register_next_step_handler(msg, process_small_setup)
+
 @bot.message_handler(commands=['export_data'])
 def cmd_export_data(msg):
     """Saari main tables ko CSV bana kar admin ko bhejta hai"""
-    if not is_admin(msg.from_user.id): return
+    # Admin check: handled via command or callback
+    if not is_admin(msg.chat.id) and not is_admin(getattr(msg, 'from_user', msg).id): return
     
     # List ko expand kiya hai taaki poora hisaab mil sake
     tables = ['USERS', 'PAYMENTS', 'WITHDRAWALS', 'MATCHES_LIST', 'TEAMS', 'LEDGER', 'CONTEST_CONFIG']
@@ -2384,10 +2472,12 @@ def process_broadcast_message(msg):
     bot.send_message(ADMIN_ID, f"✅ Broadcast finished!\n\nSent to {success_count} users.\nFailed for {fail_count} users (likely blocked the bot).")
 
 def send_prematch_reminders():
-    """Checks for upcoming matches and notifies users who haven't joined yet"""
+    """Checks for upcoming matches and notifies users who haven't joined yet, and triggers point calculation"""
     now = get_now()
     for mid, info in MATCHES.items():
         deadline = info['deadline']
+
+        # --- Prematch Reminders ---
         time_to_match = deadline - now
         
         # Match starts in 30-45 minutes
@@ -2409,6 +2499,38 @@ def send_prematch_reminders():
                         bot.send_message(uid, f"⚠️ *Team Not Joined!*\n\nAapne `{info['name']}` ke liye team banayi hai par contest join nahi kiya. Deadline se pehle join karein!", parse_mode='Markdown')
                         db.db_mark_reminder_sent(mid, uid, 'unpaid_team')
                     except: pass
+        
+        # --- Auto Match Lock & Point Calculation ---
+        # Agar deadline nikal gayi hai aur points calculate nahi hue hain
+        if now > deadline and not info['points_calculated']:
+            logging.info(f"⏳ Match {mid} deadline passed. Triggering point calculation.")
+            process_match_end(mid)
+
+def process_match_end(match_id):
+    """
+    Match deadline nikalne ke baad points calculate karta hai aur admin ko notify karta hai.
+    """
+    global MATCHES
+    logging.info(f"🚀 Starting point calculation for match: {match_id}")
+    
+    try:
+        # Fetch all player live stats for this match
+        player_live_scores_map = db.db_get_all_player_scores(match_id)
+        
+        if calculate_all_points(match_id, player_live_scores_map):
+            db.db_mark_points_calculated(match_id) # DB mein mark karein
+            MATCHES[match_id]['points_calculated'] = True # Memory cache mein update karein
+            bot.send_message(ADMIN_ID, f"✅ *Points Calculated for Match: {MATCHES[match_id]['name']}*")
+            logging.info(f"✅ Points calculation completed for match: {match_id}")
+        else:
+            bot.send_message(ADMIN_ID, f"❌ *Error in point calculation for Match: {MATCHES[match_id]['name']}*")
+            logging.error(f"❌ Error in point calculation for match: {match_id}")
+    except Exception as e:
+        logging.error(f"Error in process_match_end for {match_id}: {e}")
+        if ADMIN_ID:
+            try:
+                bot.send_message(ADMIN_ID, f"❌ Critical Error in process_match_end for {MATCHES[match_id]['name']}: {e}")
+            except: pass
 
 # ===================================================
 # FEATURE 3: Re-engagement Notification (3 Day Inactive)
@@ -2437,11 +2559,12 @@ def send_reengagement_notifications():
 # POINTS CALCULATION SYSTEM
 # ===================================================
 
-# This function is primarily for manual /up command or final calculation
 def calculate_all_points(match_id, player_scores):
     """
-    match_id: Specific match target
-    player_scores: Dictionary of {'Player Name': score}
+    Calculates points for all teams in a given match.
+    Args:
+        match_id (str): The ID of the match.
+        player_scores (dict): A dictionary of {'Player Name': total_points_from_stats}.
     """
     try:
         with db.get_db() as conn:
@@ -2461,7 +2584,7 @@ def calculate_all_points(match_id, player_scores):
                 # Har category ke players ke points jodo
                 # Include 'sub' in point calculation
                 for role in ['bat', 'wk', 'ar', 'bowl', 'sub']:
-                    for p in team_data.get(role, []):
+                    for p in team_data.get(role, []): # team_data is already JSON loaded
                         p_pts = player_scores.get(p, 0) # This comes from manual input
                         if p == captain:
                             total_pts += p_pts * scoring.CAPTAIN_MULTIPLIER  # Captain 2x
@@ -2539,7 +2662,7 @@ def process_match_input(msg):
         datetime.strptime(deadline_str, '%Y-%m-%d %H:%M')
         
         db.db_add_match(mid, name, m_type, deadline_str)
-        PLAYERS_CACHE.pop(mid, None) # Clear cache for this match
+        PLAYERS_CACHE.pop(mid, None) # Clear players cache for this match
         sync_matches_from_db() # Refresh memory cache
         uid = str(msg.from_user.id)
         ADMIN_MATCH_CONTEXT[uid] = mid # Remember match context
