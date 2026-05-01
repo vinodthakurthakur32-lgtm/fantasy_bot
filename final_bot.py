@@ -153,7 +153,8 @@ def sync_matches_from_db():
                 'type': m['type'],
                 'deadline': datetime.strptime(m['deadline'], '%Y-%m-%d %H:%M').replace(tzinfo=None),
                 'points_calculated': bool(m['points_calculated']),
-                'manual_lock': m.get('manual_lock', 0) # 0: Auto, 1: Forced Lock, -1: Forced Unlock
+                'manual_lock': m.get('manual_lock', 0), # 0: Auto, 1: Forced Lock, -1: Forced Unlock
+                'live_link': m.get('live_link')
             }
         except Exception as e:
             logging.error(f"Error parsing match {m['match_id']}: {e}")
@@ -275,7 +276,7 @@ def async_sheets_sync():
         sheet_matches = sheets.get_all_rows_safe("MATCHES")
         if sheet_matches:
             for m in sheet_matches:
-                db.db_add_match(m['match_id'], m['name'], m['type'], m['deadline'])
+                db.db_add_match(m['match_id'], m['name'], m['type'], m['deadline'], live_link=m.get('live_link'))
             sync_matches_from_db() # Refresh memory cache after sheet sync
     except: pass
 threading.Thread(target=async_sheets_sync, daemon=True).start()
@@ -770,6 +771,9 @@ def callback_view_team(call):
         if team.get('captain') and team.get('vice_captain') and not team.get('is_paid'):
             markup.add(types.InlineKeyboardButton("🚀 JOIN CONTEST NOW", callback_data=f"show_match_{match_id}"))
             
+        if not team.get('is_paid'):
+            markup.add(types.InlineKeyboardButton("🗑️ DELETE TEAM", callback_data=f"del_team_ask_{match_id}_{team_num}"))
+
     markup.add(types.InlineKeyboardButton("📊 POINTS BREAKDOWN", callback_data=f"pts_break_{match_id}_{team_num}"))
     markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
     
@@ -871,6 +875,56 @@ def callback_set_cv(call):
     # Stay on the preview screen to pick the other one or save (now handled by team_save)
     call.data = f"team_save_{match_id}_{team_num}"
     callback_team_save(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_team_ask_"))
+def callback_delete_team_ask(call):
+    parts = call.data.split("_")
+    match_id, team_num = parts[3], int(parts[4])
+    
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Match locked! Delete disabled.", show_alert=True)
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("✅ YES, DELETE", callback_data=f"del_team_confirm_{match_id}_{team_num}"),
+        types.InlineKeyboardButton("❌ NO, BACK", callback_data=f"view_team_{match_id}_{team_num}")
+    )
+    
+    bot.edit_message_text(f"⚠️ *CONFIRM DELETE*\n\nKya aap Team {team_num} ko delete karna chahte hain? Yeh action wapas nahi liya ja sakta.", 
+                         call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_team_confirm_"))
+def callback_delete_team_confirm(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num = parts[3], int(parts[4])
+    
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Match locked!", show_alert=True)
+        return
+
+    # Paid check for safety
+    team = db_get_team(uid, match_id, team_num)
+    if team and team.get('is_paid'):
+         bot.answer_callback_query(call.id, "❌ Paid team delete nahi ho sakti!", show_alert=True)
+         return
+
+    try:
+        with db.get_db() as conn:
+            conn.execute("DELETE FROM TEAMS WHERE user_id=%s AND match_id=%s AND team_num=%s", (uid, match_id, team_num))
+        
+        # Clear cache
+        cache_key = (uid, match_id, team_num)
+        if cache_key in temp_team_cache:
+            del temp_team_cache[cache_key]
+            
+        bot.answer_callback_query(call.id, "🗑️ Team deleted successfully!")
+        call.data = f"team_slots_{match_id}"
+        callback_team_slots(call)
+    except Exception as e:
+        logging.error(f"Error deleting team: {e}")
+        bot.answer_callback_query(call.id, "Error deleting team.")
 
 # ===================================================
 # CONTEST
@@ -2876,6 +2930,31 @@ def process_match_input(msg):
         bot.register_next_step_handler(msg, process_player_addition)
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}\nFormat check karein: `YYYY-MM-DD HH:MM`")
+
+@bot.message_handler(commands=['set_live_link'])
+def cmd_set_live_link(msg):
+    if not is_admin(msg.from_user.id): return
+    text = (
+        "📺 *SET LIVE STREAMING LINK*\n\n"
+        "Format: `match_id | Link` \n"
+        "Example: `m1 | https://streaming-site.com/live` \n\n"
+        "Link hatane ke liye `none` likhein."
+    )
+    sent = bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_live_link_input)
+
+def process_live_link_input(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, link = parts[0], parts[1]
+        final_link = None if link.lower() == 'none' else link
+        
+        db.db_set_live_link(mid, final_link)
+        sync_matches_from_db()
+        
+        bot.reply_to(msg, f"✅ Match `{mid}` ke liye live link update ho gaya!")
+    except:
+        bot.reply_to(msg, "❌ Invalid format! Use: `match_id | Link`")
 
 @bot.message_handler(commands=['add_player'])
 def cmd_add_player(msg):
