@@ -81,7 +81,8 @@ def init_db():
             match_id VARCHAR(255),
             player_name TEXT,
             role TEXT,
-            UNIQUE(match_id, player_name)
+            team TEXT DEFAULT 'N/A',
+            UNIQUE(match_id, player_name, team)
         )''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_match_players ON PLAYERS(match_id)")
         c.execute('''CREATE TABLE IF NOT EXISTS FAILED_UTR_LOGS (
@@ -208,7 +209,8 @@ def run_migrations():
                 ("is_paid", "INTEGER DEFAULT 0"),
                 ("points", "INTEGER DEFAULT 0")
             ],
-            "MATCHES_LIST": [("points_calculated", "INTEGER DEFAULT 0")]
+            "MATCHES_LIST": [("points_calculated", "INTEGER DEFAULT 0")],
+            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'")]
         }
         for table, cols in migrations.items():
             c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table.lower(),))
@@ -476,18 +478,18 @@ def get_live_ranks(match_id):
         """, (match_id,))
         return c.fetchall()
 
-def db_add_player(match_id, name, role):
+def db_add_player(match_id, name, role, team='N/A'):
     with get_db() as c:
         c.execute(
-            """INSERT INTO PLAYERS (match_id, player_name, role) VALUES (%s, %s, %s)
-               ON CONFLICT (match_id, player_name) DO UPDATE SET role = EXCLUDED.role""",
-            (match_id, name, role)
+            """INSERT INTO PLAYERS (match_id, player_name, role, team) VALUES (%s, %s, %s, %s)
+               ON CONFLICT (match_id, player_name, team) DO UPDATE SET role = EXCLUDED.role""",
+            (match_id, name, role, team)
         )
 
 def db_get_players_by_match(match_id):
     """Fetches the squad (names and roles) for a given match."""
     with get_db() as c:
-        c.execute("SELECT player_name, role FROM PLAYERS WHERE match_id=%s", (match_id,))
+        c.execute("SELECT player_name, role, team FROM PLAYERS WHERE match_id=%s", (match_id,))
         return c.fetchall()
 
 def db_get_player_count(match_id):
