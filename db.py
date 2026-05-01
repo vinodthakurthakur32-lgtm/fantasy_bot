@@ -74,7 +74,9 @@ def init_db():
             type VARCHAR(50), reference_id VARCHAR(255) UNIQUE, timestamp TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS MATCHES_LIST (
-            match_id VARCHAR(255) PRIMARY KEY, name TEXT, type TEXT, deadline TEXT
+            match_id VARCHAR(255) PRIMARY KEY, name TEXT, type TEXT, deadline TEXT,
+            points_calculated INTEGER DEFAULT 0, manual_lock INTEGER DEFAULT 0,
+            live_link TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS PLAYERS (
             id SERIAL PRIMARY KEY,
@@ -236,7 +238,11 @@ def run_migrations():
                 ("is_paid", "INTEGER DEFAULT 0"),
                 ("points", "INTEGER DEFAULT 0")
             ],
-            "MATCHES_LIST": [("points_calculated", "INTEGER DEFAULT 0"), ("manual_lock", "INTEGER DEFAULT 0")],
+            "MATCHES_LIST": [
+                ("points_calculated", "INTEGER DEFAULT 0"), 
+                ("manual_lock", "INTEGER DEFAULT 0"),
+                ("live_link", "TEXT")
+            ],
             "PLAYERS": [("team", "TEXT DEFAULT 'N/A'"), ("designation", "TEXT DEFAULT ''")]
         }
         for table, cols in migrations.items():
@@ -707,4 +713,9 @@ def db_set_player_stats_absolute(match_id, player_name, runs=None, wickets=None)
             c.execute("INSERT INTO PLAYER_LIVE_STATS (match_id, player_name, runs) VALUES (%s,%s,%s) ON CONFLICT(match_id, player_name) DO UPDATE SET runs = EXCLUDED.runs", (match_id, player_name, runs))
         if wickets is not None:
             c.execute("INSERT INTO PLAYER_LIVE_STATS (match_id, player_name, wickets) VALUES (%s,%s,%s) ON CONFLICT(match_id, player_name) DO UPDATE SET wickets = EXCLUDED.wickets", (match_id, player_name, wickets))
+    return True
+
+def db_set_live_link(match_id, link):
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET live_link = %s WHERE match_id = %s", (link, match_id))
     return True
