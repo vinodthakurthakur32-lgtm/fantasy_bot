@@ -241,9 +241,16 @@ def contest_list_render(matches):
     
     for mid, info in matches.items():
         deadline = info['deadline']
-        # Using dynamic lock check
-        from final_bot import is_match_locked
-        is_locked = is_match_locked(mid)
+        
+        # Logic moved here to avoid circular import with final_bot
+        m_lock = info.get('manual_lock', 0)
+        if m_lock == 1: 
+            is_locked = True
+        elif m_lock == -1: 
+            is_locked = False
+        else:
+            is_locked = datetime.now() > deadline
+            
         time_left_delta = info['deadline'] - now
 
         status_icon = "🔒" if is_locked else "⏳"
