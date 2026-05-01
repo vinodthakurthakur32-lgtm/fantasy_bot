@@ -718,6 +718,8 @@ def callback_view_team(call):
     if not is_match_locked(match_id):
         markup.add(types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}"))
         # 🚀 UX Improvement: If C/VC are set, show Join Contest button directly
+        markup.add(types.InlineKeyboardButton("🎯 SET/CHANGE C & VC", callback_data=f"set_cv_menu_{match_id}_{team_num}"))
+        
         if team.get('captain') and team.get('vice_captain') and not team.get('is_paid'):
             markup.add(types.InlineKeyboardButton("🚀 JOIN CONTEST NOW", callback_data=f"show_match_{match_id}"))
             
@@ -798,6 +800,28 @@ def callback_cv_menu(call):
     bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*\n\n_Captain aur Vice-Captain same nahi ho sakte._", 
                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
+@bot.message_handler(commands=['edit_designation'])
+def cmd_edit_designation(msg):
+    if not is_admin(msg.from_user.id): return
+    help_text = "✏️ *EDIT PLAYER DESIGNATION*\n\nFormat: `mid | Name | desig` \nEx: `m1 | Rohit Sharma | c` (or `vc` or `clear` to remove)"
+    sent = bot.send_message(msg.chat.id, help_text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_designation_edit)
+
+def process_designation_edit(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, name, desig = parts[0], parts[1], parts[2].lower()
+        if desig in ['c', 'vc', 'clear']:
+            final_desig = "" if desig == 'clear' else desig
+            with db.get_db() as conn:
+                conn.execute("UPDATE PLAYERS SET designation = %s WHERE match_id = %s AND player_name = %s", (final_desig, mid, name))
+            PLAYERS_CACHE.pop(mid, None)
+            bot.reply_to(msg, f"✅ `{name}` ka designation `{desig.upper()}` update ho gaya hai.")
+        else:
+            bot.reply_to(msg, "❌ Invalid Designation! Use `c`, `vc`, or `clear`.")
+    except Exception as e:
+        bot.reply_to(msg, "❌ Format: `mid | Name | desig` use karein.")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cv_"))
 def callback_set_cv(call):
     uid = str(call.from_user.id)
@@ -816,9 +840,9 @@ def callback_set_cv(call):
     db_save_team(uid, team, match_id, team_num)
     bot.answer_callback_query(call.id, f"{'Captain' if type_cv=='c' else 'VC'} set to {name}")
     
-    # Manually rebuilding a fake call to trigger team_save view
-    call.data = f"team_save_{match_id}_{team_num}"
-    callback_team_save(call)
+    # Go back to View Team so they can see the change and pick the other one
+    call.data = f"view_team_{match_id}_{team_num}"
+    callback_view_team(call)
 
 # ===================================================
 # CONTEST
