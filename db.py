@@ -82,6 +82,7 @@ def init_db():
             player_name TEXT,
             role TEXT,
             team TEXT DEFAULT 'N/A',
+            designation TEXT DEFAULT '',
             UNIQUE(match_id, player_name, team)
         )''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_match_players ON PLAYERS(match_id)")
@@ -236,7 +237,7 @@ def run_migrations():
                 ("points", "INTEGER DEFAULT 0")
             ],
             "MATCHES_LIST": [("points_calculated", "INTEGER DEFAULT 0"), ("manual_lock", "INTEGER DEFAULT 0")],
-            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'")]
+            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'"), ("designation", "TEXT DEFAULT ''")]
         }
         for table, cols in migrations.items():
             c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table.lower(),))
@@ -245,14 +246,12 @@ def run_migrations():
                 if col_name not in existing:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
         
-        # 🔥 FIX: Unique constraint update for PLAYERS table
+        # Constraints check for Postgres
         try:
-            # Step 1: Purani constraints ko hataiye
             c.execute("ALTER TABLE PLAYERS DROP CONSTRAINT IF EXISTS players_match_id_player_name_key")
             c.execute("ALTER TABLE PLAYERS DROP CONSTRAINT IF EXISTS players_match_id_player_name_team_key")
-            # Step 2: Duplicates saaf karein taaki nayi key lag sake
-            c.execute("DELETE FROM PLAYERS a USING PLAYERS b WHERE a.id < b.id AND a.match_id = b.match_id AND a.player_name = b.player_name AND a.team = b.team")
-            # Step 3: Nayi unique constraint lagaiye
+            
+            c.execute("DELETE FROM PLAYERS a USING PLAYERS b WHERE a.id < b.id AND a.match_id = b.match_id AND a.player_name = b.player_name AND COALESCE(a.team, 'N/A') = COALESCE(b.team, 'N/A')")
             c.execute("ALTER TABLE PLAYERS ADD CONSTRAINT players_match_id_player_name_team_key UNIQUE (match_id, player_name, team)")
         except Exception as e:
             logging.warning(f"Constraint migration info: {e}")
