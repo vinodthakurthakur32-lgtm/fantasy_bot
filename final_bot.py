@@ -39,9 +39,9 @@ ROLE_LIMITS = {
     'bat': (3, 6),
     'ar': (1, 4),
     'bowl': (3, 6),
-    'sub': (1, 4)
+    'sub': (0, 4)
 }
-ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Substitute'}
+ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Impact/Sub'}
 NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
 MIN_WITHDRAWAL = 200
 
@@ -170,14 +170,18 @@ def get_players(match_id):
         return PLAYERS_CACHE[match_id]
         
     db_players = db.db_get_players_by_match(match_id)
-    formatted_data = {r: [] for r in ROLES}
+    # 🛠️ Structure change: Storing dict with name and display info
+    formatted_data = {r: [] for r in ROLES} 
     
     for p in db_players:
         role = p.get('role', '').lower()
         if role in formatted_data:
-            # Player name ke saath team dikhane ke liye
-            display_name = f"{p['player_name']} ({p['team']})"
-            formatted_data[role].append(display_name)
+            tag = " Ⓒ" if p.get('designation', '').lower() == 'c' else " Ⓥ" if p.get('designation', '').lower() == 'vc' else ""
+            display_name = f"{p['player_name']} ({p['team']}){tag}"
+            formatted_data[role].append({
+                'name': p['player_name'],
+                'display': display_name
+            })
     
     PLAYERS_CACHE[match_id] = formatted_data
     return formatted_data
@@ -544,9 +548,11 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
         markup = types.InlineKeyboardMarkup(row_width=1)
         
         for player in get_players(match_id)[role]:
-            status = "✅" if player in selected else "⬜"
-            callback = f"sel_{match_id}_{team_num}_{role}_{player.replace(' ', '_')}"
-            markup.add(types.InlineKeyboardButton(f"{status} {player}", callback_data=callback))
+            p_name = player_obj['name']
+            status = "✅" if p_name in selected else "⬜"
+            # 🛠️ Logical change: Callback only uses clean name
+            callback = f"sel_{match_id}_{team_num}_{role}_{p_name.replace(' ', '_')}"
+            markup.add(types.InlineKeyboardButton(f"{status} {player_obj['display']}", callback_data=callback))
         
         # 🆕 Role Switcher: Direct jump to any category
         role_switcher = []
@@ -560,8 +566,8 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
         markup.row(*role_switcher[3:])
 
         nav_row = []
-        if role == 'bowl':
-            nav_row.append(types.InlineKeyboardButton("✅ SAVE TEAM", callback_data=f"team_save_{match_id}_{team_num}"))
+        if total >= 11:
+            nav_row.append(types.InlineKeyboardButton("🚀 PREVIEW & SAVE TEAM", callback_data=f"team_save_{match_id}_{team_num}"))
         
         markup.row(*nav_row)
         
@@ -569,10 +575,11 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
         
         # 🆕 Live Squad Summary
         squad_list = []
-        for r_key in ['bat', 'wk', 'ar', 'bowl']:
+        for r_key in ['bat', 'wk', 'ar', 'bowl', 'sub']:
             p_names = team.get(r_key, [])
             if p_names:
-                squad_list.append(f"*{ROLE_NAMES[r_key][:3]}:* " + ", ".join(p_names))
+                label = "IMP" if r_key == 'sub' else ROLE_NAMES[r_key][:3].upper()
+                squad_list.append(f"*{label}:* " + ", ".join(p_names))
         
         summary_text = "\n".join(squad_list) if squad_list else "_Abhi tak koi player select nahi kiya._"
 
@@ -588,7 +595,11 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
         )
 
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
+            try:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
+            except telebot.apihelper.ApiTelegramException as e:
+                if "message is not modified" not in e.description.lower():
+                    logging.error(f"Telegram API Error: {e}")
         else:
             bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
     except Exception as e:
@@ -613,30 +624,17 @@ def callback_team_save(call):
     if not team:
         bot.answer_callback_query(call.id, "❌ Build team first!")
         return
-    
-    main_11 = get_total_players(team)
-    if main_11 != 11:
-        bot.answer_callback_query(call.id, f"❌ Starting 11 mein 11 players hone chahiye (Abhi: {main_11})")
+
+    total_count = get_total_players(team)
+    if total_count < 11:
+        bot.answer_callback_query(call.id, f"❌ Kam se kam 11 players hone chahiye (Abhi: {total_count})", show_alert=True)
         return
-    
+
     for role, (r_min, r_max) in ROLE_LIMITS.items():
         count = len(team.get(role, []))
         if not (r_min <= count <= r_max):
             bot.answer_callback_query(call.id, f"❌ {ROLE_NAMES[role]} must be between {r_min}-{r_max}!")
             return
-    
-    # Strict C/VC Validation before final save
-    if not team.get('captain') or not team.get('vice_captain'):
-        bot.answer_callback_query(call.id, "⚠️ Please select Captain & VC first!", show_alert=True)
-        # Redirect to C/VC menu directly
-        callback_cv_menu(call)
-        return
-
-    # FIX 2 & ADD 6: Team Preview Before Final Save
-    if not team.get('captain') or not team.get('vice_captain'):
-        bot.answer_callback_query(call.id, "👑 Pehle Captain aur VC select karo!", show_alert=True)
-        callback_cv_menu(call)
-        return
 
     preview_text = f"📝 *TEAM PREVIEW (T{team_num})*\n"
     for role_key in ROLES:
@@ -644,11 +642,11 @@ def callback_team_save(call):
         if players:
             preview_text += f"\n*{ROLE_NAMES[role_key]}:* {', '.join(players)}"
     
-    preview_text += f"\n\n👑 *C:* {team.get('captain')}\n⭐ *VC:* {team.get('vice_captain')}"
+    preview_text += f"\n\n👑 *C:* {team.get('captain', 'Not Selected')}\n⭐ *VC:* {team.get('vice_captain', 'Not Selected')}"
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("✅ CONFIRM & SAVE", callback_data=f"final_confirm_save_{match_id}_{team_num}"),
+        types.InlineKeyboardButton("✅ CONFIRM & PROCEED TO C/VC", callback_data=f"final_confirm_save_{match_id}_{team_num}"),
         types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}")
     )
     bot.edit_message_text(preview_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
@@ -661,6 +659,10 @@ def callback_final_confirm_save(call):
     
     team = db_get_team(uid, match_id, team_num)
     team['team_saved'] = 1
+    
+    # Ensure C/VC are initialized to None if not set, to avoid errors in db_save_team
+    if 'captain' not in team: team['captain'] = None
+    if 'vice_captain' not in team: team['vice_captain'] = None
     db_save_team(uid, team, match_id, team_num)
 
     # Final Sync to Sheets (One row per team)
@@ -676,23 +678,12 @@ def callback_final_confirm_save(call):
         "captain": team.get('captain', 'N/A'),
         "vice_captain": team.get('vice_captain', 'N/A')
     }, "TEAMS")
-
-    summary = f"🎉 *TEAM {team_num} SAVED!*\n\n"
-    for role in ROLES:
-        players = team.get(role, [])
-        if players:
-            summary += f"*{ROLE_NAMES[role]}:* {len(players)}\n"
-    
-    c = team.get('captain')
-    vc = team.get('vice_captain')
-    summary += f"\n👑 C: {c if c else '❌'}\n⭐ VC: {vc if vc else '❌'}"
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("👑 SELECT CAPTAIN/VC", callback_data=f"set_cv_menu_{match_id}_{team_num}"))
-    markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
-    
-    bot.edit_message_text(summary, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
     bot.answer_callback_query(call.id, "✅ Team Saved!")
+    
+    # Directly call the C/VC menu
+    # Create a dummy call object to pass to callback_cv_menu
+    dummy_call = types.CallbackQuery(id=call.id, from_user=call.from_user, message=call.message, chat_instance=call.chat_instance, data=f"set_cv_menu_{match_id}_{team_num}")
+    callback_cv_menu(dummy_call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_team_"))
 def callback_view_team(call):
@@ -705,18 +696,23 @@ def callback_view_team(call):
         bot.answer_callback_query(call.id, "Team not found!")
         return
 
-    text = f"⚾ *Team {team_num} Summary - {MATCHES[match_id]['name']}*\n\n"
+    text = f"🎉 *TEAM {team_num} SAVED! - {MATCHES[match_id]['name']}*\n\n"
     for role in ROLES:
         players = team.get(role, [])
         if players:
             text += f"*{ROLE_NAMES[role]}:* {', '.join(players)}\n"
     
     text += f"\n👑 C: {team.get('captain', '❌')}\n⭐ VC: {team.get('vice_captain', '❌')}"
+    text += f"\n\n━━━━━━━━━━━━━━━━━━━━"
     text += f"\n💰 Paid: {'✅ YES' if team.get('is_paid') else '❌ NO'}"
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     if not is_match_locked(match_id):
         markup.add(types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}"))
+        # 🚀 UX Improvement: If C/VC are set, show Join Contest button directly
+        if team.get('captain') and team.get('vice_captain') and not team.get('is_paid'):
+            markup.add(types.InlineKeyboardButton("🚀 JOIN CONTEST NOW", callback_data=f"show_match_{match_id}"))
+            
     markup.add(types.InlineKeyboardButton("📊 POINTS BREAKDOWN", callback_data=f"pts_break_{match_id}_{team_num}"))
     markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
     
@@ -770,20 +766,28 @@ def callback_cv_menu(call):
         return
 
     team = db_get_team(uid, match_id, team_num)
+    players_info = get_players(match_id)
     
+    # Create a mapping of clean_name -> display_name for the menu
+    display_map = {}
+    for role in ROLES:
+        for p_obj in players_info.get(role, []):
+            display_map[p_obj['name']] = p_obj['display']
+
     all_players = []
     for role in ['bat', 'wk', 'ar', 'bowl']:
         all_players.extend(team.get(role, []))
     
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=1) # Changed to row_width=1 for better display of C/VC status
     for p in all_players:
+        d_name = display_map.get(p, p)
         markup.add(
-            types.InlineKeyboardButton(f"👑 C: {p}", callback_data=f"cv_{match_id}_{team_num}_c_{p.replace(' ', '_')}"),
-            types.InlineKeyboardButton(f"⭐ VC: {p}", callback_data=f"cv_{match_id}_{team_num}_vc_{p.replace(' ', '_')}")
+            types.InlineKeyboardButton(f"👑 C: {d_name}", callback_data=f"cv_{match_id}_{team_num}_c_{p.replace(' ', '_')}"),
+            types.InlineKeyboardButton(f"⭐ VC: {d_name}", callback_data=f"cv_{match_id}_{team_num}_vc_{p.replace(' ', '_')}")
         )
     markup.add(types.InlineKeyboardButton("🔙 BACK", callback_data=f"team_save_{match_id}_{team_num}"))
     
-    bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*", 
+    bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*\n\n_Captain aur Vice-Captain same nahi ho sakte._", 
                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cv_"))
@@ -873,7 +877,9 @@ def callback_join_match(call):
             buttons.append(types.InlineKeyboardButton(label, callback_data=f"confirm_join_{match_id}_{i}_{fee}"))
     
     if not found_any:
-        bot.answer_callback_query(call.id, "❌ No saved teams for this match! Use 'MY TEAM' first.", show_alert=True)
+        bot.answer_callback_query(call.id, "🚀 Aapki koi saved team nahi mili! Chaliye pehle team banate hain.", show_alert=True)
+        # Redirect to Team Builder (Slot 1, starting with Batsmen)
+        show_player_selection(call.message.chat.id, uid, 'bat', match_id, 1, call.message.message_id)
         return
 
     markup.add(*buttons)
@@ -2171,8 +2177,8 @@ def handle_selection(call):
         selected.remove(player_name)
         bot.answer_callback_query(call.id, f"❌ {player_name} removed!")
     else:
-        if role != 'sub' and total >= 11:
-            bot.answer_callback_query(call.id, "⚠️ Squad full! (Max 11 Players)", show_alert=True)
+        if total >= 15:
+            bot.answer_callback_query(call.id, "⚠️ Squad full! (Max 15 players including subs)", show_alert=True)
             return
 
         if len(selected) >= role_max:
@@ -2210,6 +2216,7 @@ def callback_catchall(call):
         elif action == "view":
             # Re-using the list_players logic
             call.message.text = f"/list_players {mid}"
+            call.message.from_user = call.from_user # Admin check pass karne ke liye clicker info add ki
             cmd_list_players(call.message)
             
         elif action == "del":
@@ -2849,9 +2856,15 @@ def process_player_addition(msg):
         for entry in entries:
             if not entry: continue
             parts = [p.strip() for p in entry.split("|")]
+            designation = ""
             
-            if len(parts) == 4: # mid | name | role | team
-                mid, name, role, team = parts[0], parts[1], parts[2].lower(), parts[3].upper()
+            if len(parts) == 5: # mid | name | role | team | desig
+                mid, name, role, team, designation = parts[0], parts[1], parts[2].lower(), parts[3].upper(), parts[4].lower()
+            elif len(parts) == 4: 
+                if parts[0] in MATCHES: # mid | name | role | team
+                    mid, name, role, team = parts[0], parts[1], parts[2].lower(), parts[3].upper()
+                elif default_mid: # name | role | team | desig
+                    mid, name, role, team, designation = default_mid, parts[0], parts[1].lower(), parts[2].upper(), parts[3].lower()
             elif len(parts) == 3 and default_mid: # name | role | team
                 mid, name, role, team = default_mid, parts[0], parts[1].lower(), parts[2].upper()
             elif len(parts) == 2 and default_mid: # name | role (Legacy)
@@ -2868,7 +2881,7 @@ def process_player_addition(msg):
                 continue
                 
             try:
-                db.db_add_player(mid, name, role, team)
+                db.db_add_player(mid, name, role, team, designation)
                 PLAYERS_CACHE.pop(mid, None) # Invalidate cache
                 added_players.append(f"✅ {name} ({role.upper()} - {team})")
             except Exception as e:
@@ -2992,9 +3005,10 @@ def cmd_list_players(msg):
             markup.add(types.InlineKeyboardButton(f"🔹 {ROLE_NAMES[role].upper()} 🔹", callback_data="ignore"))
             row = []
             for p in p_list:
-                # Extract name without team: "Virat Kohli (RCB)" -> "Virat Kohli"
-                name_only = p.split(' (')[0]
-                row.append(types.InlineKeyboardButton(f"🗑️ {p}", callback_data=f"adm_p_vdel_{mid}_{name_only.replace(' ', '_')}"))
+                # Dictionary data structure ke hisaab se update kiya
+                p_name = p['name']
+                p_display = p['display']
+                row.append(types.InlineKeyboardButton(f"🗑️ {p_display}", callback_data=f"adm_p_vdel_{mid}_{p_name.replace(' ', '_')}"))
                 if len(row) == 2:
                     markup.row(*row)
                     row = []
