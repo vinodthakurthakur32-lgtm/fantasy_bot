@@ -857,11 +857,16 @@ def callback_join_match(call):
         return
 
     # Show saved slots to join with
+    # ⚡ OPTIMIZATION: Fetch all teams in ONE query instead of 50
+    all_user_teams = db.db_get_all_user_teams(uid, match_id)
+    teams_map = {int(t['team_num']): t for t in all_user_teams}
+
     markup = types.InlineKeyboardMarkup(row_width=4)
     buttons = []
     found_any = False
+    
     for i in range(1, 51):
-        t = db_get_team(uid, match_id, i)
+        t = teams_map.get(i)
         if t and t.get('team_saved'):
             found_any = True
             # Indicate if already paid for this slot
@@ -2184,6 +2189,13 @@ def handle_selection(call):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_catchall(call):
+    # 1. Ignore dummy buttons instantly
+    if call.data == "ignore":
+        bot.answer_callback_query(call.id)
+        return
+
+    import admin_app # Import at the start of handler to fix UnboundLocalError
+
     # Route Match Management Callbacks
     if call.data.startswith("adm_m_"):
         if not is_admin(call.from_user.id): return
