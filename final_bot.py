@@ -570,7 +570,7 @@ def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, mes
         markup.row(*role_switcher[3:])
 
         nav_row = []
-        if total >= 11:
+        if total == 11:
             nav_row.append(types.InlineKeyboardButton("🚀 PREVIEW & SAVE TEAM", callback_data=f"team_save_{match_id}_{team_num}"))
         
         markup.row(*nav_row)
@@ -634,8 +634,8 @@ def callback_team_save(call):
         return
 
     total_count = get_total_players(team)
-    if total_count < 11:
-        bot.answer_callback_query(call.id, f"❌ Kam se kam 11 players hone chahiye (Abhi: {total_count})", show_alert=True)
+    if total_count != 11:
+        bot.answer_callback_query(call.id, f"❌ Team mein barabar 11 players (Playing 11) hone chahiye! (Abhi: {total_count})", show_alert=True)
         return
 
     for role, (r_min, r_max) in ROLE_LIMITS.items():
@@ -2179,15 +2179,21 @@ def handle_selection(call):
     
     selected = team.get(role, [])
     _, role_max = ROLE_LIMITS[role]
-    total = get_total_players(team)
+    total_core = get_total_players(team)
+    total_subs = len(team.get('sub', []))
 
     if player_name in selected:
         selected.remove(player_name)
         bot.answer_callback_query(call.id, f"❌ {player_name} removed!")
     else:
-        if total >= 15:
-            bot.answer_callback_query(call.id, "⚠️ Squad full! (Max 15 players including subs)", show_alert=True)
-            return
+        if role == 'sub':
+            if total_subs >= 4:
+                bot.answer_callback_query(call.id, "⚠️ Max 4 Impact Players allowed!", show_alert=True)
+                return
+        else:
+            if total_core >= 11:
+                bot.answer_callback_query(call.id, "⚠️ Playing 11 full! Extra players sirf 'Sub' category mein add karein.", show_alert=True)
+                return
 
         if len(selected) >= role_max:
             bot.answer_callback_query(call.id, f"⚠️ {ROLE_NAMES[role]} ki limit {role_max} hai!", show_alert=True)
