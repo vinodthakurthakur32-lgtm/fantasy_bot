@@ -786,12 +786,6 @@ def callback_cv_menu(call):
     team = db_get_team(uid, match_id, team_num)
     players_info = get_players(match_id)
     
-    # Create a mapping of clean_name -> display_name for the menu
-    display_map = {}
-    for role in ROLES:
-        for p_obj in players_info.get(role, []):
-            display_map[p_obj['name']] = p_obj['display']
-
     # Filter: Sirf wahi players dikhao jo user ki team mein hain AUR Admin ne C/VC designate kiye hain
     admin_cv_list = players_info.get('cv', []) # Admin designated candidates
     user_selected_names = []
@@ -816,12 +810,18 @@ def callback_cv_menu(call):
             types.InlineKeyboardButton(f"{vc_icon} VICE-CAPTAIN", callback_data=f"cv_{match_id}_{team_num}_vc_{p_name.replace(' ', '_')}")
         )
 
+    # Done button: Only prominent if both are selected
+    if team.get('captain') and team.get('vice_captain'):
+        markup.add(types.InlineKeyboardButton("🚀 DONE & SAVE TEAM", callback_data=f"view_team_{match_id}_{team_num}"))
+
     if not available_candidates:
-        markup.row(types.InlineKeyboardButton("⚠️ No designated C/VC in your team!", callback_data="ignore"))
+        markup.row(types.InlineKeyboardButton("⚠️ No Admin-Designated C/VC in your team!", callback_data="ignore"))
+        markup.add(types.InlineKeyboardButton("✏️ EDIT SQUAD", callback_data=f"nav_bat_{match_id}_{team_num}"))
 
     markup.add(types.InlineKeyboardButton("🔙 BACK", callback_data=f"team_save_{match_id}_{team_num}"))
     
-    bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*\n\n_Captain aur Vice-Captain same nahi ho sakte._", 
+    summary = f"👑 *C:* {team.get('captain', '❌')}\n⭐ *VC:* {team.get('vice_captain', '❌')}"
+    bot.edit_message_text(f"🎯 *SET C & VC (Admin Picks Only)*\n\n{summary}\n\n_Captain (2x points) aur Vice-Captain (1.5x) same nahi ho sakte._", 
                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.message_handler(commands=['edit_designation'])
@@ -872,9 +872,9 @@ def callback_set_cv(call):
     db_save_team(uid, team, match_id, team_num)
     bot.answer_callback_query(call.id, f"{'Captain' if type_cv=='c' else 'VC'} set to {name}")
     
-    # Go back to View Team so they can see the change and pick the other one
-    call.data = f"view_team_{match_id}_{team_num}"
-    callback_view_team(call)
+    # Stay in the same menu to pick the other one
+    call.data = f"set_cv_menu_{match_id}_{team_num}"
+    callback_cv_menu(call)
 
 # ===================================================
 # CONTEST
