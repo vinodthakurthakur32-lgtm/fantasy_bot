@@ -1053,8 +1053,8 @@ def send_payment_ui(chat_id, uid, amount, match_id, team_num):
         "💳 *Add Money*\n\n"
         f"Amount: *₹{amount}*\n"
         f"UPI: `{PAYMENT_UPI}`\n\n"
-        "✅ *Payment karne ke baad uska Screenshot ya 12-digit UTR number yahan niche message mein bhejein.*\n\n"
-        "🚀 Aapki team/wallet verification ke turant baad activate ho jayegi.\n\n"
+        "👉 *After payment:*\n"
+        "Send **UTR number** ya **Screenshot** isi chat mein bhein.\n\n"
         "⚡ *Fast verification*"
     )
 
@@ -2594,14 +2594,14 @@ def send_prematch_reminders():
         # --- Prematch Reminders ---
         time_to_match = deadline - now
         
-        # Match starts in 30-45 minutes
-        if timedelta(minutes=30) <= time_to_match <= timedelta(minutes=45):
+        # Match starts in 60-75 minutes
+        if timedelta(minutes=60) <= time_to_match <= timedelta(minutes=75):
             # 1. Users with NO team saved
             users_no_team = db.db_get_users_without_team(mid)
             for uid in users_no_team:
                 if not db.db_was_reminder_sent(mid, uid, 'prematch'):
                     try:
-                        bot.send_message(uid, f"🏏 *Match Starting Soon!* ⏳\n\n`{info['name']}` ka deadline 30 min mein hai. Jaldi apni team banayein aur join karein!", parse_mode='Markdown')
+                        bot.send_message(uid, f"🏏 *Match Starting Soon!* ⏳\n\n`{info['name']}` ka deadline 60 min mein hai. Jaldi apni team banayein aur join karein!", parse_mode='Markdown')
                         db.db_mark_reminder_sent(mid, uid, 'prematch')
                     except: pass
             
@@ -2614,11 +2614,12 @@ def send_prematch_reminders():
                         db.db_mark_reminder_sent(mid, uid, 'unpaid_team')
                     except: pass
         
-        # --- Auto Match Lock & Point Calculation ---
-        # Agar deadline nikal gayi hai aur points calculate nahi hue hain
-        if now > deadline and not info['points_calculated']:
-            logging.info(f"⏳ Match {mid} deadline passed. Triggering point calculation.")
-            process_match_end(mid)
+        # --- Auto Match Lock ---
+        # Match lock hona automatic hai, lekin calculation manual settlement ke baad hoga
+        if now > deadline:
+            if mid not in _selection_cooldown: # Log only once
+                logging.info(f"⏳ Match {mid} deadline passed. Match is now LOCKED.")
+                _selection_cooldown[mid] = True 
 
 def process_match_end(match_id):
     """
