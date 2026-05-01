@@ -736,10 +736,9 @@ def callback_final_confirm_save(call):
     }, "TEAMS")
     bot.answer_callback_query(call.id, "✅ Team Saved!")
     
-    # Directly call the C/VC menu
-    # Create a dummy call object to pass to callback_cv_menu
-    dummy_call = types.CallbackQuery(id=call.id, from_user=call.from_user, message=call.message, chat_instance=call.chat_instance, data=f"set_cv_menu_{match_id}_{team_num}")
-    callback_cv_menu(dummy_call)
+    # Redirect to match dashboard where Mega/Medium/Small contests are shown
+    call.data = f"show_match_{match_id}"
+    callback_show_match(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_team_"))
 def callback_view_team(call):
