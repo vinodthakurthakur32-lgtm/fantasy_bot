@@ -2809,7 +2809,12 @@ def process_match_input(msg):
         ADMIN_MATCH_CONTEXT[uid] = mid # Remember match context
         ADMIN_MATCH_CONTEXT[uid + "_wizard"] = True # Start setup wizard
 
-        bot.reply_to(msg, f"✅ *Match Added: {name}*\n\nAb is match ke liye *Players* bhein (Har line pe ek):\n`Name | role` (e.g. `Virat Kohli | bat`)", parse_mode='Markdown')
+        bot.reply_to(msg, (
+            f"✅ *Match Added: {name}*\n\n"
+            "Ab is match ke liye *Players* bhein.\n"
+            "Format: `Name | Role | Desig | Team`\n"
+            "Example: `Virat Kohli | bat | c | RCB`"
+        ), parse_mode='Markdown')
         bot.register_next_step_handler(msg, process_player_addition)
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}\nFormat check karein: `YYYY-MM-DD HH:MM`")
@@ -2820,7 +2825,12 @@ def cmd_add_player(msg):
     active_mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id), "m1")
     help_text = (
         "👤 *QUICK ADD PLAYER*\n\n"
-        "👉 *Format 1 (Bulk):*\n"
+        "👉 *Standard Format:*\n"
+        "`Name | Role | Designation | Team`\n\n"
+        "✅ *Example:*\n"
+        "`Virat Kohli | bat | c | RCB`\n"
+        "`MS Dhoni | wk | vc | CSK`\n\n"
+        "👉 *Format 1 (Bulk with Match ID):*\n"
         f"`{active_mid}` (Pehli line)\n"
         "`Player Name | role` (Baaki lines)\n\n"
         "👉 *Format 2 (Single):*\n"
@@ -2867,13 +2877,13 @@ def process_player_addition(msg):
             parts = [p.strip() for p in entry.split("|")]
             designation = ""
             
-            if len(parts) == 5: # mid | name | role | team | desig
-                mid, name, role, team, designation = parts[0], parts[1], parts[2].lower(), parts[3].upper(), parts[4].lower()
+            if len(parts) == 5: # mid | name | role | desig | team
+                mid, name, role, designation, team = parts[0], parts[1], parts[2].lower(), parts[3].lower(), parts[4].upper()
             elif len(parts) == 4: 
                 if parts[0] in MATCHES: # mid | name | role | team
                     mid, name, role, team = parts[0], parts[1], parts[2].lower(), parts[3].upper()
-                elif default_mid: # name | role | team | desig
-                    mid, name, role, team, designation = default_mid, parts[0], parts[1].lower(), parts[2].upper(), parts[3].lower()
+                elif default_mid: # name | role | desig | team
+                    mid, name, role, designation, team = default_mid, parts[0], parts[1].lower(), parts[2].lower(), parts[3].upper()
             elif len(parts) == 3 and default_mid: # name | role | team
                 mid, name, role, team = default_mid, parts[0], parts[1].lower(), parts[2].upper()
             elif len(parts) == 2 and default_mid: # name | role (Legacy)
