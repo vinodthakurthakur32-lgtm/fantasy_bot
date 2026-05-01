@@ -180,11 +180,11 @@ def db_get_all_contest_configs(mid):
         c.execute("SELECT * FROM CONTEST_CONFIG WHERE match_id=%s", (mid,))
         return c.fetchall()
 
-def db_add_match(mid, name, m_type, deadline):
+def db_add_match(mid, name, m_type, deadline, points_calculated=0):
     with get_db() as c:
         c.execute("""
-            INSERT INTO MATCHES_LIST (match_id, name, type, deadline) VALUES (%s, %s, %s, %s)
-            ON CONFLICT (match_id) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type, deadline = EXCLUDED.deadline
+            INSERT INTO MATCHES_LIST (match_id, name, type, deadline, points_calculated) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (match_id) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type, deadline = EXCLUDED.deadline, points_calculated = EXCLUDED.points_calculated
         """, (mid, name, m_type, deadline))
 
 def db_get_matches():
@@ -207,7 +207,8 @@ def run_migrations():
             "TEAMS": [
                 ("is_paid", "INTEGER DEFAULT 0"),
                 ("points", "INTEGER DEFAULT 0")
-            ]
+            ],
+            "MATCHES_LIST": [("points_calculated", "INTEGER DEFAULT 0")]
         }
         for table, cols in migrations.items():
             c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table.lower(),))
@@ -627,3 +628,8 @@ def db_get_player_live_stats_map(match_id):
         c.execute("SELECT * FROM PLAYER_LIVE_STATS WHERE match_id=%s", (match_id,))
         rows = c.fetchall()
         return {r['player_name']: r for r in rows}
+
+def db_mark_points_calculated(match_id):
+    """Marks a match as having its points calculated"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 1 WHERE match_id = %s", (match_id,))
