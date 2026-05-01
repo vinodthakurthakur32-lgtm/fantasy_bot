@@ -89,6 +89,7 @@ def admin_dashboard_home(stats, matches):
         types.InlineKeyboardButton(fraud_btn_text, callback_data="adm_nav_fraud"),
         types.InlineKeyboardButton("🏆 Leaderboard", callback_data="adm_nav_lead"),
         types.InlineKeyboardButton("📤 Export Data", callback_data="adm_export_data"),
+        types.InlineKeyboardButton("🛠 Match Setup Guide", callback_data="adm_nav_help"), # Direct button for the new setup flow
         types.InlineKeyboardButton("❓ Help", callback_data="adm_nav_help"),
         types.InlineKeyboardButton("🔄 Refresh Data", callback_data="adm_nav_home")
     )
@@ -409,7 +410,7 @@ def contest_selection_render(match_id, match_name):
 def team_points_breakdown_render(match_id, team_num, team_data, player_stats_map):
     res = f"📊 *TEAM PERFORMANCE (T{team_num})*\n━━━━━━━━━━━━━━━━━━━━\n"
     total = 0
-    for role in ['bat', 'wk', 'ar', 'bowl']:
+    for role in ['bat', 'wk', 'ar', 'bowl', 'sub']:
         p_list = team_data.get(role, [])
         if not p_list: continue
         res += f"\n*{role.upper()}*\n"
