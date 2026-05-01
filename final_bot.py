@@ -331,8 +331,12 @@ def db_save_team(user_id, team_data, match_id='m1', team_num=1):
                 INSERT INTO TEAMS (user_id, match_id, team_num, team_players, captain, vice_captain, team_saved, is_paid) 
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id, match_id, team_num) 
-                DO UPDATE SET team_players = EXCLUDED.team_players, captain = EXCLUDED.captain, 
-                              vice_captain = EXCLUDED.vice_captain, team_saved = EXCLUDED.team_saved, is_paid = EXCLUDED.is_paid
+                DO UPDATE SET 
+                    team_players = EXCLUDED.team_players, 
+                    captain = COALESCE(EXCLUDED.captain, TEAMS.captain), 
+                    vice_captain = COALESCE(EXCLUDED.vice_captain, TEAMS.vice_captain), 
+                    team_saved = GREATEST(TEAMS.team_saved, EXCLUDED.team_saved), 
+                    is_paid = GREATEST(TEAMS.is_paid, EXCLUDED.is_paid)
             """, (str(user_id), match_id, team_num, team_json, team_data.get('captain'), team_data.get('vice_captain'), team_data.get('team_saved', 0), team_data.get('is_paid', 0)))
         # Clear cache to force refresh on next access
         cache_key = (str(user_id), match_id, int(team_num))
@@ -1049,8 +1053,8 @@ def send_payment_ui(chat_id, uid, amount, match_id, team_num):
         "💳 *Add Money*\n\n"
         f"Amount: *₹{amount}*\n"
         f"UPI: `{PAYMENT_UPI}`\n\n"
-        "👉 *After payment:*\n"
-        "Send **UTR number** ya **Screenshot** isi chat mein bhein.\n\n"
+        "✅ *Payment karne ke baad uska Screenshot ya 12-digit UTR number yahan niche message mein bhejein.*\n\n"
+        "🚀 Aapki team/wallet verification ke turant baad activate ho jayegi.\n\n"
         "⚡ *Fast verification*"
     )
 
