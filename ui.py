@@ -1,438 +1,2884 @@
-import time
-from datetime import datetime
+import os
+import telebot
 from telebot import types
+import json
+from datetime import datetime, timedelta
+import time
+import re
+import html
+from contextlib import contextmanager
+import logging
+import threading
+import csv
+import io
+
+# Modular Imports
+try:
+    import pytz
+    IST = pytz.timezone('Asia/Kolkata')
+except ImportError:
+    IST = None
+
 import db
+import sheets
+import ui
+import scoring
 
-def get_loading_render(progress):
-    fill = int(progress / 10)
-    bar = "█" * fill + "▒" * (10 - fill)
-    return f"⏳ *Loading System Components...*\n\n`{bar}` {progress}%"
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', 'my_secret_token_123')
+from dotenv import load_dotenv
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def fake_animate(bot, chat_id, message_id):
-    for p in [20, 50, 80, 100]:
+from flask import Flask, request, abort
+
+# ===================================================
+# CONFIGURATION
+# ===================================================
+ROLES = ['bat', 'wk', 'ar', 'bowl', 'sub']
+ROLE_LIMITS = {
+    'wk': (1, 4),
+    'bat': (3, 6),
+    'ar': (1, 4),
+    'bowl': (3, 6),
+    'sub': (1, 4)
+}
+ROLE_NAMES = {'bat': 'Batsmen', 'wk': 'Wicketkeepers', 'ar': 'All-rounders', 'bowl': 'Bowlers', 'sub': 'Substitute'}
+NEXT_ROLES = {'bat': 'wk', 'wk': 'ar', 'ar': 'bowl', 'bowl': 'sub'}
+DB_FILE = "crickteam11.db"
+MIN_WITHDRAWAL = 200
+
+# FIX 4: Selection Cooldown
+_selection_cooldown = {}
+
+# SEC 2: Input Sanitization helper
+def sanitize_input(text, max_len=100):
+    if not text: return ""
+    clean = re.sub(r'<[^>]*?>', '', text) # Strip HTML
+    return clean[:max_len].strip()
+
+MATCHES = {}
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
+
+# 1. Token aur Admin ID - Priority to environment variables
+TOKEN = os.getenv('BOT_TOKEN', '').strip()
+ADMIN_ID = os.getenv('ADMIN_ID', '').strip()
+
+# 2. Webhook Host detection
+WEBHOOK_HOST = os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL') or f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+
+if not TOKEN or not ADMIN_ID:
+    logging.error("❌ CRITICAL: BOT_TOKEN or ADMIN_ID is missing!")
+    raise ValueError("Missing essential Environment Variables.")
+
+def get_now():
+    """Returns current time in IST (Indian Standard Time)"""
+    if IST:
+        return datetime.now(IST).replace(tzinfo=None)
+    return datetime.now() + timedelta(hours=5, minutes=30)
+
+def get_payment_channel():
+    return db.db_get_setting('PAYMENT_CHANNEL_ID', os.getenv('PAYMENT_CHANNEL_ID', ADMIN_ID))
+
+def get_support_channel():
+    return db.db_get_setting('SUPPORT_CHANNEL_ID', os.getenv('SUPPORT_CHANNEL_ID', '-1003909393820'))
+
+PAYMENT_UPI = os.getenv('PAYMENT_UPI', "amankumar8879@ibl")
+
+# Flask Server Setup
+server = Flask(__name__)
+# CRITICAL: threaded=False is required for Webhook mode in Flask/Gunicorn
+bot = telebot.TeleBot(TOKEN, threaded=False)
+
+@server.route('/', methods=['GET'])
+def index():
+    return "Bot is running!", 200
+
+@server.route('/healthz', methods=['GET'])
+def health():
+    return "OK", 200
+
+@server.route('/bot-webhook', methods=['GET', 'POST'])
+def webhook():
+    """Telegram Webhook Endpoint"""
+    if request.method == 'GET':
+        return "🤖 Webhook is active! Telegram sends updates here via POST.", 200
+
+    if request.headers.get('content-type') == 'application/json':
+        logging.info("📥 Webhook hit: POST request received")
         try:
-            bot.edit_message_text(get_loading_render(p), chat_id, message_id, parse_mode='Markdown')
-            time.sleep(0.3)
-        except: pass
+            json_string = request.get_data(as_text=True)
+            update = telebot.types.Update.de_json(json_string)
+            
+            # SEC 1: Webhook Signature Verification
+            secret_header = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+            if WEBHOOK_SECRET and secret_header != WEBHOOK_SECRET:
+                return "Unauthorized", 403
 
-def home_screen_markup(matches):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for mid, info in matches.items():
-        markup.add(types.InlineKeyboardButton(f"🏏 {info['name']} (Live)", callback_data=f"app_match_{mid}"))
+            if update:
+                msg_type = "Message" if update.message else "ChannelPost" if update.channel_post else "Callback" if update.callback_query else "Update"
+                logging.info(f"🔔 Update ID {update.update_id} ({msg_type}) parsing to handlers...")
+                bot.process_new_updates([update])
+            return '', 200
+        except Exception as e:
+            logging.error(f"❌ Webhook Processing Error: {e}")
+            return '', 200 # Telegram ko 200 bhein taaki wo retry na kare
+    else:
+        abort(403)
+
+def get_support_handle():
+    # Handle ko saaf karke return karein taaki link hamesha sahi bane
+    return db.db_get_setting('SUPPORT_HANDLE', 'CRICK_Community001').replace('@', '').strip()
+
+def get_channel_handle():
+    return db.db_get_setting('CHANNEL_HANDLE', 'crick_channel001')
+
+def is_admin(user_id):
+    """Checks if the given user_id is the authorized administrator"""
+    return str(user_id) == str(ADMIN_ID)
+
+def sync_matches_from_db():
+    """Database se matches load karke global MATCHES dict mein dalta hai"""
+    global MATCHES
+    db_matches = db.db_get_matches()
+    for m in db_matches:
+        try:
+            MATCHES[m['match_id']] = {
+                'name': m['name'],
+                'type': m['type'],
+                'deadline': datetime.strptime(m['deadline'], '%Y-%m-%d %H:%M').replace(tzinfo=None)
+            }
+        except Exception as e:
+            logging.error(f"Error parsing match {m['match_id']}: {e}")
+
+# Memory cache to make UI interaction lightning fast
+PLAYERS_CACHE = {}
+
+# 🛠 Admin Active Match Context: To speed up player/point updates
+ADMIN_MATCH_CONTEXT = {}
+
+def get_players(match_id):
+    """Database se players fetch karke role-wise dictionary return karega (With Cache)"""
+    if match_id in PLAYERS_CACHE:
+        return PLAYERS_CACHE[match_id]
+        
+    db_players = db.db_get_players_by_match(match_id)
+    formatted_data = {r: [] for r in ROLES}
     
-    markup.row(
-        types.InlineKeyboardButton("💰 Wallet", callback_data="app_wallet"),
-        types.InlineKeyboardButton("🏆 Ranks", callback_data="app_global_ranks")
+    for p in db_players:
+        role = p.get('role', '').lower()
+        if role in formatted_data:
+            formatted_data[role].append(p['player_name'])
+    
+    PLAYERS_CACHE[match_id] = formatted_data
+    return formatted_data
+
+user_active_match = {} # Tracks which match user is paying for
+user_deposit_amount = {} # Temporary store for deposit amount input
+temp_team_cache = {} # Selection cache
+user_active_order = {} # user_id -> order_id mapping
+# State tracking for replies (No manual 'Reply' needed in Telegram)
+ACTIVE_REPLY_STATE = {} # {chat_id: (ticket_id, user_id, orig_msg_id, orig_text)}
+
+def process_payment_success(user_id, amount, ref_id, match_context=None, conn=None):
+    """
+    Atomic transaction to process successful payments.
+    ref_id can be UTR, Webhook ID, or Screenshot File ID.
+    If conn is provided, uses existing transaction to avoid database locks.
+    """
+    def _do_work(c):
+        # 1. Idempotency Check
+        c.execute("SELECT id FROM LEDGER WHERE reference_id=%s", (ref_id,))
+        exists = c.fetchone()
+        if exists: return False, "Payment already processed."
+
+        # 2. Add to Ledger
+        c.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'CREDIT', %s, %s)",
+                  (str(user_id), amount, ref_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+        # 3. Mark team/context as paid
+        if match_context and "_" in match_context:
+            mid, tnum = match_context.split("_")
+            if mid != "wallet":
+                c.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (str(user_id), mid, int(tnum)))
+                
+                # 🎁 Check for Referral Reward (First Contest Join)
+                c.execute("SELECT referred_by FROM USERS WHERE user_id=%s", (str(user_id),))
+                user_info = c.fetchone()
+                if user_info and user_info['referred_by']:
+                    referrer_id = user_info['referred_by']
+                    # Reward logic (db_reward_referrer provides idempotency check internally)
+                    if db.db_reward_referrer(referrer_id, user_id, amount=10):
+                        try:
+                            bot.send_message(referrer_id, f"🎊 *Referral Bonus!*\n\nAapke referral ne pehla contest join kar liya hai! Aapko ₹10 bonus mila hai.", parse_mode='Markdown')
+                        except: pass
+
+        return True, "Success"
+
+    if conn:
+        return _do_work(conn)
+    else:
+        try:
+            with db.get_db() as new_conn: return _do_work(new_conn)
+        except Exception as e: return False, str(e)
+
+def is_match_locked(match_id='m1'):
+    """Checks if the match deadline has passed"""
+    deadline = MATCHES.get(match_id, {}).get('deadline', datetime.now())
+    return get_now() > deadline
+
+def get_time_left(match_id='m1'):
+    """Returns countdown string until lock"""
+    match_info = MATCHES.get(match_id)
+    if not match_info: return "N/A"
+    deadline = match_info.get('deadline', datetime.now())
+    delta = deadline - get_now()
+    if delta.total_seconds() <= 0: return "LOCKED 🔒"
+    return f"{delta.days}d {delta.seconds//3600}h {(delta.seconds//60)%60}m"
+
+# ===================================================
+# INITIALIZATION
+# ===================================================
+db.init_db()
+db.run_migrations()
+sync_matches_from_db()
+
+# 🆕 Async GSheets Sync: Taki bot start hone mein delay na ho
+def async_sheets_sync():
+    try:
+        sheet_matches = sheets.get_all_rows_safe("MATCHES")
+        if sheet_matches:
+            for m in sheet_matches:
+                db.db_add_match(m['match_id'], m['name'], m['type'], m['deadline'])
+            sync_matches_from_db() # Refresh memory cache after sheet sync
+    except: pass
+threading.Thread(target=async_sheets_sync, daemon=True).start()
+
+def setup_webhook():
+    """Sets up the webhook for production environments"""
+    if WEBHOOK_HOST and os.getenv('RENDER'):
+        clean_host = WEBHOOK_HOST.strip().strip('/')
+        if not clean_host.startswith('http'):
+            clean_host = f"https://{clean_host}"
+        
+        webhook_url = f"{clean_host}/bot-webhook"
+        logging.info(f"⚙️ Webhook Sync: Target URL is {webhook_url}")
+        
+        try:
+            current_info = bot.get_webhook_info()
+            if not current_info.url or current_info.url.strip('/') != webhook_url.strip('/'):
+                bot.remove_webhook()
+                time.sleep(0.5)
+                # SEC 1: Set webhook with secret token
+                bot.set_webhook(url=webhook_url, drop_pending_updates=True, 
+                                allowed_updates=["message", "callback_query", "channel_post"],
+                                secret_token=WEBHOOK_SECRET)
+                logging.info(f"🚀 Webhook successfully set to: {webhook_url}")
+            else:
+                logging.info("✅ Webhook already configured correctly.")
+        except Exception as e:
+            logging.error(f"❌ Webhook Setup Error: {e}")
+
+# Trigger Webhook Setup during module load for Gunicorn
+if os.getenv('RENDER'):
+    setup_webhook()
+
+# ===================================================
+# CONSTANTS
+# ===================================================
+
+# ===================================================
+# DATABASE FUNCTIONS
+# ===================================================
+
+def db_get_team(user_id, match_id='m1', team_num=1):
+    """Priority: Return from Cache, then DB"""
+    cache_key = (str(user_id), match_id, int(team_num))
+    if cache_key in temp_team_cache:
+        return temp_team_cache[cache_key]
+
+    # Using internal modular function
+    data = db.db_get_team_internal(user_id, match_id, team_num)
+    if data:
+        temp_team_cache[cache_key] = data
+    return data
+
+def db_save_team(user_id, team_data, match_id='m1', team_num=1):
+    """Persist to SQLite and invalidate cache for consistency"""
+    try:
+        with db.get_db() as conn:
+            team_json = json.dumps({k: team_data.get(k, []) for k in ROLES})
+            conn.execute("""
+                INSERT INTO TEAMS (user_id, match_id, team_num, team_players, captain, vice_captain, team_saved, is_paid) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, match_id, team_num) 
+                DO UPDATE SET team_players = EXCLUDED.team_players, captain = EXCLUDED.captain, 
+                              vice_captain = EXCLUDED.vice_captain, team_saved = EXCLUDED.team_saved, is_paid = EXCLUDED.is_paid
+            """, (str(user_id), match_id, team_num, team_json, team_data.get('captain'), team_data.get('vice_captain'), team_data.get('team_saved', 0), team_data.get('is_paid', 0)))
+        # Clear cache to force refresh on next access
+        cache_key = (str(user_id), match_id, int(team_num))
+        if cache_key in temp_team_cache:
+            del temp_team_cache[cache_key]
+    except Exception as e:
+        logging.error(f"Error saving team: {e}")
+
+def db_has_saved_team(user_id, match_id):
+    """Checks if user has at least one saved team for a match"""
+    try:
+        with db.get_db() as conn:
+            conn.execute("SELECT 1 FROM TEAMS WHERE user_id=%s AND match_id=%s AND team_saved=1 LIMIT 1", (str(user_id), match_id))
+            row = conn.fetchone()
+            return True if row else False
+    except Exception as e:
+        logging.error(f"Error checking saved team: {e}")
+        return False
+
+def get_total_players(team):
+    """Returns count of starting 11 players only"""
+    if not team:
+        return 0
+    count = 0
+    for role in ['bat', 'wk', 'ar', 'bowl']:
+        if isinstance(team.get(role), list):
+            count += len(team.get(role, []))
+    return count
+
+def get_paid_count():
+    try:
+        with db.get_db() as conn:
+            conn.execute("SELECT COUNT(*) as cnt FROM USERS WHERE paid=1")
+            result = conn.fetchone()
+            return result['cnt'] if result else 0
+    except Exception as e:
+        logging.error(f"Error getting paid count: {e}")
+        return 0
+
+def get_leaderboard(limit=10):
+    try:
+        with db.get_db() as conn:
+            conn.execute(
+                "SELECT u.username, u.first_name, t.points FROM TEAMS t JOIN USERS u ON t.user_id = u.user_id WHERE t.points > 0 ORDER BY t.points DESC LIMIT %s",
+                (limit,)
+            )
+            rows = conn.fetchall()
+            return rows
+    except Exception as e:
+        logging.error(f"Error getting leaderboard: {e}")
+        return []
+
+# ===================================================
+# START COMMAND
+# ===================================================
+
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    """Basic Start with Registration Logic"""
+    uid = str(message.from_user.id)
+    logging.info(f"✅ Handler Triggered: /start command from {uid}")
+
+    # ⚡ Optimized: Single DB call for Register + Get + LastSeen
+    is_new_registration, user_data = db.db_register_user_optimized(uid, message.from_user.username, message.from_user.first_name)
+
+    # Existing home message returning users ko milega as before
+    if is_new_registration:
+        send_onboarding_step1(message.chat.id, message.from_user.first_name)
+        return  # Tour start, baaki start_command skip
+    referrer = None
+    if len(message.text.split()) > 1:
+        ref_data = message.text.split()[1]
+        if ref_data.startswith('ref'):
+            potential_ref = ref_data.replace('ref', '')
+            if potential_ref.isdigit() and potential_ref != uid:
+                referrer = potential_ref
+
+    # Sheets sync
+    try:
+        sheets.sync_wrapper({
+            "user_id": uid,
+            "username": message.from_user.username or "N/A",
+            "first_name": message.from_user.first_name or "N/A",
+            "paid": 0,
+            "balance": 0,
+            "joined_date": get_now().strftime('%Y-%m-%d %H:%M:%S')
+        }, "USERS")
+    except: pass
+
+    if referrer and is_new_registration:
+        with db.get_db() as conn:
+            conn.execute("UPDATE USERS SET referred_by = %s WHERE user_id = %s AND referred_by IS NULL", (referrer, uid))
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🏆 CONTEST", "💰 WALLET", "⚾ MY TEAM", "👥 LEADERBOARD", "📊 STATS", "ℹ️ HELP")
+
+    # Channel Link Logic
+    c_handle = get_channel_handle().replace('@', '').strip()
+    c_url = f"https://t.me/{c_handle}"
+    s_url = f"https://t.me/{get_support_handle()}"
+
+    inline_markup = types.InlineKeyboardMarkup()
+    inline_markup.add(types.InlineKeyboardButton("💬 PUBLIC QUERY GROUP", url=s_url))
+    inline_markup.add(types.InlineKeyboardButton("🔗 SHARE BOT", switch_inline_query=f"Join & Win: https://t.me/{bot.get_me().username}?start=ref{uid}"))
+
+    brief = (
+        f"🏏 <b>Welcome, {message.from_user.first_name}!</b>\n\n"
+        "� <b>90% Prize Pool</b> • ⚡ <b>Fast UPI Payout</b>\n\n"
+        "🎯 <b>Kaise jeetein:</b>\n"
+        "1️⃣ Team banao (11 players)\n"
+        "2️⃣ Captain/VC set karo\n"
+        "3️⃣ Contest join karo\n\n"
+        f"📈 <b>Min Withdrawal:</b> ₹{MIN_WITHDRAWAL}\n"
+        f"🔥 <b>Next:</b> Click <b>🏆 CONTEST</b> niche menu se match select karne ke liye!"
     )
-    return markup, "📱 *CRICK-TEAM11 DASHBOARD*\n\nSelect a live match to view real-time scoring and your standing."
+    bot.send_message(message.chat.id, brief, reply_markup=markup, parse_mode='HTML')
+    bot.send_message(message.chat.id, "👇 <b>Updates aur Winner Screenshots ke liye join karein:</b>", reply_markup=inline_markup, parse_mode='HTML')
 
-def match_screen_markup(match_id, match_name, ranks):
-    markup = types.InlineKeyboardMarkup(row_width=2)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("copy_channel_handle_"))
+def callback_copy_channel_handle(call):
+    channel_handle = call.data.split("_")[3]
+    bot.answer_callback_query(
+        call.id,
+        f"Channel Username: @{channel_handle}\n\nIs username ko copy karke Telegram search bar mein paste karein.",
+        show_alert=True
+    )
+# ===================================================
+# MY TEAM - BUILD TEAM
+# ===================================================
+
+@bot.message_handler(commands=['myteam'])
+@bot.message_handler(func=lambda m: m.text and "MY TEAM" in m.text)
+def cmd_my_team(msg):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for mid, info in MATCHES.items():
+        markup.add(types.InlineKeyboardButton(f"⚾ Build for {info['name']}", callback_data=f"team_slots_{mid}"))
+    bot.send_message(msg.chat.id, "Select Match to Build Team:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("team_slots_"))
+def callback_team_slots(call):
+    # ⚡ 1. Sabse pehle answer karein taki Telegram ka loading icon hat jaye
+    bot.answer_callback_query(call.id)
+
+    # Robust parsing for match_id
+    parts = call.data.split("_")
+    if len(parts) < 3: return
     
-    rank_text = "🏆 *LIVE LEADERBOARD*\n"
-    if not ranks:
-        rank_text += "_No points recorded yet._"
-    for i, r in enumerate(ranks[:5], 1):
-        medal = "🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else "🔹"
-        rank_text += f"{medal} {r['first_name']} - {r['points']} pts\n"
+    match_id = parts[2]
+    page = int(parts[3]) if len(parts) > 3 else 1
+    uid = str(call.from_user.id)
 
+    # ⚡ Optimization: Fetch all teams for this user and match in one single query
+    # Loop ke andar db_get_team call karne se N+1 performance issue hota hai
+    all_user_teams = db.db_get_all_user_teams(uid, match_id)
+    # Create a lookup map: team_num -> data
+    teams_map = {int(t['team_num']): t for t in all_user_teams}
+
+    markup = types.InlineKeyboardMarkup(row_width=5)
+    buttons = []
+    
+    # Paginated slots (10 per page)
+    start_idx = (page - 1) * 10 + 1
+    end_idx = start_idx + 10
+    
+    for i in range(start_idx, end_idx):
+        t_data = teams_map.get(i)
+        is_saved = t_data and t_data.get('team_saved') == 1
+        
+        label = f"T{i}✅" if is_saved else f"T{i}"
+        cb = f"view_team_{match_id}_{i}" if is_saved else f"nav_bat_{match_id}_{i}"
+        buttons.append(types.InlineKeyboardButton(label, callback_data=cb))
+
+    markup.add(*buttons)
+    
+    # Pagination Controls
+    nav_btns = []
+    if page > 1:
+        nav_btns.append(types.InlineKeyboardButton("⬅️ Prev", callback_data=f"team_slots_{match_id}_{page-1}"))
+    if page < 5:
+        nav_btns.append(types.InlineKeyboardButton("Next ➡️", callback_data=f"team_slots_{match_id}_{page+1}"))
+    if nav_btns:
+        markup.row(*nav_btns)
+
+    markup.add(types.InlineKeyboardButton("🔙 BACK TO MATCHES", callback_data="cmd_my_team_nav"))
+
+    preview_text = f"⚾ *MY TEAMS: {MATCHES[match_id]['name']}*\n"
+    preview_text += f"Page {page}/5 (Slots {start_idx}-{end_idx-1})\n\n"
+    preview_text += "Select an empty slot to create a team, or a ✅ slot to view/edit."
+    
+    bot.edit_message_text(preview_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "cmd_my_team_nav")
+def callback_my_team_nav(call):
+    cmd_my_team(call.message)
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+
+def show_player_selection(chat_id, user_id, role, match_id='m1', team_num=1, message_id=None):
+    """Fast UI update using Cache-First data"""
+    try:
+        if is_match_locked(match_id):
+            bot.send_message(chat_id, "🚫 *MATCH LOCKED*\n\nMatch start ho chuka hai, ab team nahi badal sakte!", parse_mode='Markdown')
+            return
+
+        team = db_get_team(user_id, match_id, team_num)
+        if not team:
+            team = {k: [] for k in ROLES}
+        
+        selected = team.get(role, [])
+        
+        # Total count for UI
+        total = get_total_players(team)
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        for player in get_players(match_id)[role]:
+            status = "✅" if player in selected else "⬜"
+            callback = f"sel_{match_id}_{team_num}_{role}_{player.replace(' ', '_')}"
+            markup.add(types.InlineKeyboardButton(f"{status} {player}", callback_data=callback))
+        
+        # 🆕 Role Switcher: Direct jump to any category
+        role_switcher = []
+        for r_code in ['bat', 'wk', 'ar', 'bowl', 'sub']:
+            label = r_code.upper()
+            if r_code == role:
+                label = f"» {label} «"
+            role_switcher.append(types.InlineKeyboardButton(label, callback_data=f"nav_{r_code}_{match_id}_{team_num}"))
+        
+        markup.row(*role_switcher[:3])
+        markup.row(*role_switcher[3:])
+
+        nav_row = []
+        if role == 'bowl':
+            nav_row.append(types.InlineKeyboardButton("✅ SAVE TEAM", callback_data=f"team_save_{match_id}_{team_num}"))
+        
+        markup.row(*nav_row)
+        
+        role_min, role_max = ROLE_LIMITS[role]
+        
+        # 🆕 Live Squad Summary
+        squad_list = []
+        for r_key in ['bat', 'wk', 'ar', 'bowl']:
+            p_names = team.get(r_key, [])
+            if p_names:
+                squad_list.append(f"*{ROLE_NAMES[r_key][:3]}:* " + ", ".join(p_names))
+        
+        summary_text = "\n".join(squad_list) if squad_list else "_Abhi tak koi player select nahi kiya._"
+
+        text = (
+            f"🏏 *Team Builder - {MATCHES[match_id]['name']}*\n"
+            f"Slot: `T{team_num}` | Section: *{ROLE_NAMES[role]}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Category: `{len(selected)}/{role_max}` | 👥 Squad: `{total}/11`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 *Aapki Team:*\n{summary_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 *Players select karne ke liye tap karein:*"
+        )
+
+        if message_id:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Error in show_player_selection: {e}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
+
+# ===================================================
+# SAVE TEAM
+# ===================================================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("team_save_"))
+def callback_team_save(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num = parts[2], int(parts[3])
+    
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Team Locked!", show_alert=True)
+        return
+
+    team = db_get_team(uid, match_id, team_num) # Checks cache first
+    if not team:
+        bot.answer_callback_query(call.id, "❌ Build team first!")
+        return
+    
+    main_11 = get_total_players(team)
+    if main_11 != 11:
+        bot.answer_callback_query(call.id, f"❌ Starting 11 mein 11 players hone chahiye (Abhi: {main_11})")
+        return
+    
+    for role, (r_min, r_max) in ROLE_LIMITS.items():
+        count = len(team.get(role, []))
+        if not (r_min <= count <= r_max):
+            bot.answer_callback_query(call.id, f"❌ {ROLE_NAMES[role]} must be between {r_min}-{r_max}!")
+            return
+    
+    # Strict C/VC Validation before final save
+    if not team.get('captain') or not team.get('vice_captain'):
+        bot.answer_callback_query(call.id, "⚠️ Please select Captain & VC first!", show_alert=True)
+        # Redirect to C/VC menu directly
+        callback_cv_menu(call)
+        return
+
+    # FIX 2 & ADD 6: Team Preview Before Final Save
+    if not team.get('captain') or not team.get('vice_captain'):
+        bot.answer_callback_query(call.id, "👑 Pehle Captain aur VC select karo!", show_alert=True)
+        callback_cv_menu(call)
+        return
+
+    preview_text = f"📝 *TEAM PREVIEW (T{team_num})*\n"
+    for role_key in ROLES:
+        players = team.get(role_key, [])
+        if players:
+            preview_text += f"\n*{ROLE_NAMES[role_key]}:* {', '.join(players)}"
+    
+    preview_text += f"\n\n👑 *C:* {team.get('captain')}\n⭐ *VC:* {team.get('vice_captain')}"
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("🔄 Refresh Score", callback_data=f"app_match_{match_id}"),
+        types.InlineKeyboardButton("✅ CONFIRM & SAVE", callback_data=f"final_confirm_save_{match_id}_{team_num}"),
+        types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}")
+    )
+    bot.edit_message_text(preview_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("final_confirm_save_"))
+def callback_final_confirm_save(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num = parts[3], int(parts[4])
+    
+    team = db_get_team(uid, match_id, team_num)
+    team['team_saved'] = 1
+    db_save_team(uid, team, match_id, team_num)
+
+    # Final Sync to Sheets (One row per team)
+    all_players = []
+    for r in ROLES:
+        all_players.extend(team.get(r, []))
+    
+    sheets.sync_wrapper({
+        "user_id": uid,
+        "match": MATCHES[match_id]['name'],
+        "team_num": team_num,
+        "players": ", ".join(all_players),
+        "captain": team.get('captain', 'N/A'),
+        "vice_captain": team.get('vice_captain', 'N/A')
+    }, "TEAMS")
+
+    summary = f"🎉 *TEAM {team_num} SAVED!*\n\n"
+    for role in ROLES:
+        players = team.get(role, [])
+        if players:
+            summary += f"*{ROLE_NAMES[role]}:* {len(players)}\n"
+    
+    c = team.get('captain')
+    vc = team.get('vice_captain')
+    summary += f"\n👑 C: {c if c else '❌'}\n⭐ VC: {vc if vc else '❌'}"
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("👑 SELECT CAPTAIN/VC", callback_data=f"set_cv_menu_{match_id}_{team_num}"))
+    markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
+    
+    bot.edit_message_text(summary, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    bot.answer_callback_query(call.id, "✅ Team Saved!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_team_"))
+def callback_view_team(call):
+    parts = call.data.split("_")
+    match_id, team_num = parts[2], int(parts[3])
+    uid = str(call.from_user.id)
+    
+    team = db_get_team(uid, match_id, team_num)
+    if not team:
+        bot.answer_callback_query(call.id, "Team not found!")
+        return
+
+    text = f"⚾ *Team {team_num} Summary - {MATCHES[match_id]['name']}*\n\n"
+    for role in ROLES:
+        players = team.get(role, [])
+        if players:
+            text += f"*{ROLE_NAMES[role]}:* {', '.join(players)}\n"
+    
+    text += f"\n👑 C: {team.get('captain', '❌')}\n⭐ VC: {team.get('vice_captain', '❌')}"
+    text += f"\n💰 Paid: {'✅ YES' if team.get('is_paid') else '❌ NO'}"
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if not is_match_locked(match_id):
+        markup.add(types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}"))
+    markup.add(types.InlineKeyboardButton("📊 POINTS BREAKDOWN", callback_data=f"pts_break_{match_id}_{team_num}"))
+    markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pts_break_"))
+def callback_points_breakdown(call):
+    parts = call.data.split("_")
+    match_id, team_num = parts[2], int(parts[3])
+    uid = str(call.from_user.id)
+    
+    team = db_get_team(uid, match_id, team_num)
+    player_stats_map = db.db_get_player_live_stats_map(match_id)
+    
+    markup, text = ui.team_points_breakdown_render(match_id, team_num, team, player_stats_map)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("copy_upi_"))
+def callback_copy_upi(call):
+    upi = call.data.split("_")[2]
+    # Alert dikha kar user ko batana ki copy kaise karein
+    bot.answer_callback_query(call.id, f"UPI ID: {upi}\n\nMessage mein di gayi ID par tap karke copy karein!", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sel_"))
+def callback_select_player(call):
+    handle_selection(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("nav_"))
+def callback_navigate_role(call):
+    parts = call.data.split("_")
+    if len(parts) < 4: return
+    
+    role = parts[1]
+    match_id = parts[2]
+    try:
+        team_num = int(parts[3])
+    except ValueError:
+        # Handle case where match_id might have underscores
+        team_num = int(parts[-1])
+        match_id = "_".join(parts[2:-1])
+        
+    show_player_selection(call.message.chat.id, str(call.from_user.id), role, match_id, team_num, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_cv_menu_"))
+def callback_cv_menu(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num = parts[3], int(parts[4])
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Team Locked!", show_alert=True)
+        return
+
+    team = db_get_team(uid, match_id, team_num)
+    
+    all_players = []
+    for role in ['bat', 'wk', 'ar', 'bowl']:
+        all_players.extend(team.get(role, []))
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for p in all_players:
+        markup.add(
+            types.InlineKeyboardButton(f"👑 C: {p}", callback_data=f"cv_{match_id}_{team_num}_c_{p.replace(' ', '_')}"),
+            types.InlineKeyboardButton(f"⭐ VC: {p}", callback_data=f"cv_{match_id}_{team_num}_vc_{p.replace(' ', '_')}")
+        )
+    markup.add(types.InlineKeyboardButton("🔙 BACK", callback_data=f"team_save_{match_id}_{team_num}"))
+    
+    bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*", 
+                         call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cv_"))
+def callback_set_cv(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id = parts[1]
+    team_num = int(parts[2])
+    type_cv = parts[3] # 'c' or 'vc'
+    name = "_".join(parts[4:]).replace('_', ' ')
+    
+    team = db_get_team(uid, match_id, team_num)
+    if type_cv == 'c':
+        team['captain'] = name
+    else:
+        team['vice_captain'] = name
+    
+    db_save_team(uid, team, match_id, team_num)
+    bot.answer_callback_query(call.id, f"{'Captain' if type_cv=='c' else 'VC'} set to {name}")
+    
+    # Manually rebuilding a fake call to trigger team_save view
+    call.data = f"team_save_{match_id}_{team_num}"
+    callback_team_save(call)
+
+# ===================================================
+# CONTEST
+# ===================================================
+
+@bot.message_handler(commands=['contest'])
+@bot.message_handler(func=lambda m: "CONTEST" in m.text)
+def cmd_contest(msg):
+    uid = str(msg.from_user.id)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    now = get_now()
+    
+    # Global check if user has ANY saved team across ANY match
+    has_any_team = False
+    with db.get_db() as conn:
+        conn.execute("SELECT 1 FROM TEAMS WHERE user_id=%s AND team_saved=1 LIMIT 1", (uid,))
+        row = conn.fetchone()
+        has_any_team = bool(row)
+
+    for mid, info in MATCHES.items():
+        deadline = info['deadline']
+        day_str = "TODAY" if deadline.date() == now.date() else "TOMORROW" if deadline.date() == (now.date() + timedelta(days=1)) else deadline.strftime('%d %b')
+        
+        if is_match_locked(mid):
+            status = "🔒"
+        else:
+            status = f"🏏 [{info['type']}] {day_str} {deadline.strftime('%H:%M')}"
+        markup.add(types.InlineKeyboardButton(f"{status} {info['name']} - {get_time_left(mid)}", callback_data=f"show_match_{mid}"))
+    
+    text = "🏆 *Matches*\n\n👉 *Next: Select a match to join contests*"
+    if not has_any_team:
+        text += "\n\n⚠️ *No team?*\n👉 Pehle team banao"
+        markup.add(types.InlineKeyboardButton("🏏 CREATE TEAM", callback_data="cmd_my_team_nav"))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="app_home"))
+
+    bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("join_"))
+def callback_join_match(call):
+    parts = call.data.split("_")
+    match_id, fee = parts[1], int(parts[2])
+    uid = str(call.from_user.id)
+    
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Match is Locked!", show_alert=True)
+        return
+
+    # Show saved slots to join with
+    markup = types.InlineKeyboardMarkup(row_width=4)
+    buttons = []
+    found_any = False
+    for i in range(1, 51):
+        t = db_get_team(uid, match_id, i)
+        if t and t.get('team_saved'):
+            found_any = True
+            # Indicate if already paid for this slot
+            label = f"T{i} 💳" if t.get('is_paid') else f"T{i}"
+            buttons.append(types.InlineKeyboardButton(label, callback_data=f"confirm_join_{match_id}_{i}_{fee}"))
+    
+    if not found_any:
+        bot.answer_callback_query(call.id, "❌ No saved teams for this match! Use 'MY TEAM' first.", show_alert=True)
+        return
+
+    markup.add(*buttons)
+    markup.add(types.InlineKeyboardButton("⬅️ BACK", callback_data=f"show_match_{match_id}"))
+    bot.edit_message_text(f"🏅 *Join Contest* (Entry: ₹{fee})\nSelect the Team Slot you want to use:", 
+                         call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_join_"))
+def callback_confirm_join(call):
+    parts = call.data.split("_")
+    match_id, team_num, fee = parts[2], parts[3], int(parts[4])
+    callback_pay_now(call) # Use the existing payment flow logic
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_match_"))
+def callback_show_match(call):
+    mid = call.data.split("_")[2]
+    uid = str(call.from_user.id)
+    default_fee = 100
+    
+    info = MATCHES.get(mid)
+    stats = db.get_contest_stats(mid, default_fee)
+    user_summary = db.get_user_match_summary(uid, mid)
+    has_team = db_has_saved_team(uid, mid)
+    time_left = get_time_left(mid)
+    
+    # Dynamically fetch all configured contests for this match
+    configs = db.db_get_all_contest_configs(mid)
+
+    markup, text = ui.match_dashboard_render(mid, info, stats, user_summary, time_left, configs, default_fee)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("breakup_"))
+def callback_prize_breakup(call):
+    parts = call.data.split("_")
+    match_id, fee = parts[1], int(parts[2])
+    
+    # Get current contest config to know max slots
+    config = db.db_get_contest_config(match_id, fee)
+    slots = config['max_slots'] if config else 50
+    
+    markup, text = ui.prize_breakdown_render(match_id, fee, slots)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.answer_callback_query(call.id, "Error loading breakup.")
+
+@bot.message_handler(commands=['set_contest_size'])
+def cmd_set_contest_size(msg):
+    if not is_admin(msg.from_user.id): return
+    help_txt = (
+        "📏 *ADD/UPDATE CONTEST*\n\n"
+        "Format: `match_id | entry_fee | max_slots`\n\n"
+        "💡 *Note:* \n"
+        "• ₹100+ = 🥇 Mega\n"
+        "• ₹50-99 = 🥈 Medium\n"
+        "• Under ₹50 = 🥉 Small\n\n"
+        "Example: `demo_m1 | 100 | 50`"
+    )
+    sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_contest_size)
+
+@bot.message_handler(commands=['delete_contest'])
+def cmd_delete_contest(msg):
+    if not is_admin(msg.from_user.id): return
+    help_txt = "🗑️ *DELETE CONTEST*\n\nFormat: `match_id | entry_fee` \nExample: `demo_m1 | 20`"
+    sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_delete_contest)
+
+def process_delete_contest(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, fee = parts[0], int(parts[1])
+        db.db_delete_contest(mid, fee)
+        bot.reply_to(msg, f"✅ Match `{mid}` se ₹{fee} wala contest delete ho gaya!")
+    except:
+        bot.reply_to(msg, "❌ Error! Format: `match_id | fee` use karein.")
+
+def process_contest_size(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        mid, fee, slots = parts[0], int(parts[1]), int(parts[2])
+        db.db_set_contest_config(mid, fee, slots)
+        bot.reply_to(msg, f"✅ *Contest Configured!*\nMatch: `{mid}`\nFee: ₹{fee}\nMax Slots: {slots}\n\nAb users ko 70% winners wala breakup dikhega.")
+    except Exception as e:
+        bot.reply_to(msg, "❌ Error! Use format: `mid | fee | slots`")
+
+@bot.message_handler(commands=['set_prize_config'])
+def cmd_set_prize_config(msg):
+    if not is_admin(msg.from_user.id): return
+    help_txt = (
+        "🏆 *PRIZE DISTRIBUTION CONFIG*\n\n"
+        "Format: `Commission | Winners% | R1% | R2% | R3%`\n\n"
+        "Example: `10 | 70 | 35 | 20 | 12`"
+    )
+    sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_prize_config)
+
+def process_prize_config(msg):
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        comm, wins, r1, r2, r3 = parts[0], parts[1], parts[2], parts[3], parts[4]
+        
+        db.db_set_setting('PRIZE_COMMISSION', comm)
+        db.db_set_setting('PRIZE_WINNERS_PCT', wins)
+        db.db_set_setting('PRIZE_R1_PCT', r1)
+        db.db_set_setting('PRIZE_R2_PCT', r2)
+        db.db_set_setting('PRIZE_R3_PCT', r3)
+        
+        bot.reply_to(msg, "✅ *Prize Logic Updated!* \n\nAb sabhi naye breakup isi calculation par chalenge.")
+    except Exception as e:
+        bot.reply_to(msg, "❌ Error! Format: `10 | 70 | 35 | 20 | 12` check karein.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("team_slots_nav_"))
+def callback_team_slots_nav(call):
+    parts = call.data.split("_")
+    callback_team_slots(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "contest_list")
+def callback_contest_list(call):
+    cmd_contest(call.message)
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "build_team")
+def callback_build_team(call):
+    bot.answer_callback_query(call.id)
+    show_player_selection(call.message.chat.id, str(call.from_user.id), 'bat')
+
+# ===================================================
+# PAYMENT
+# ===================================================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_now_"))
+def callback_pay_now(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    chat_id = call.message.chat.id
+
+    # Handle direct wallet deposit (without match)
+    if len(parts) > 2 and parts[2] == "wallet":
+        match_id, team_num = "wallet", "0"
+        amount = int(db.db_get_user_state(uid, 'deposit_amount') or 100)
+    else:
+        match_id, team_num, amount = parts[2], parts[3], int(parts[4])
+        team = db_get_team(uid, match_id, int(team_num)) or {}
+        if not team or not team.get('team_saved'):
+            bot.answer_callback_query(call.id, "❌ Pehle team save karein!", show_alert=True)
+            return
+
+    try:
+        bot.answer_callback_query(call.id)
+    except: pass
+
+    send_payment_ui(chat_id, uid, amount, match_id, team_num)
+
+def send_payment_ui(chat_id, uid, amount, match_id, team_num):
+    """Centralized function to send payment instructions"""
+    context = f"{match_id}_{team_num}"
+    order_id = db.db_create_order(uid, amount, context)
+    db.db_set_user_state(uid, 'deposit_amount', amount)
+    db.db_set_user_state(uid, 'active_match_context', context)
+
+    pay_msg = (
+        "💳 *Add Money*\n\n"
+        f"Amount: *₹{amount}*\n"
+        f"UPI: `{PAYMENT_UPI}`\n\n"
+        "👉 *After payment:*\n"
+        "Send **UTR number** ya **Screenshot** isi chat mein bhein.\n\n"
+        "⚡ *Fast verification*"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(f"📋 Copy UPI ID: {PAYMENT_UPI}", callback_data=f"copy_upi_{PAYMENT_UPI}"))
+    
+    # Wallet Check
+    balance = db.db_get_wallet_balance(uid)
+    if balance >= amount and match_id != "wallet":
+        markup.add(types.InlineKeyboardButton(f"💳 PAY FROM WALLET (₹{balance})", callback_data=f"wallet_pay_{match_id}_{team_num}_{amount}"))
+    
+    markup.add(types.InlineKeyboardButton("📤 UPLOAD SCREENSHOT", callback_data="ready_screenshot"))
+    markup.add(types.InlineKeyboardButton("❌ CANCEL", callback_data="payment_cancel"))
+
+    bot.send_message(chat_id, pay_msg, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wallet_pay_"))
+def callback_wallet_pay(call):
+    uid = str(call.from_user.id)
+    parts = call.data.split("_")
+    match_id, team_num, amount = parts[2], parts[3], int(parts[4])
+    
+    try:
+        with db.get_db() as conn:
+            balance = db.db_get_wallet_balance(uid)
+            if balance < amount:
+                bot.answer_callback_query(call.id, "❌ Insufficient Balance!", show_alert=True)
+                return
+            
+            # Debit Transaction in Ledger
+            ref = f"DEBIT_MATCH_{match_id}_{team_num}_{int(time.time())}"
+            conn.execute(
+                "INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                (uid, -amount, ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            conn.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (uid, match_id, team_num))
+        
+        bot.edit_message_caption(caption=f"✅ *Success!*\n₹{amount} deducted from wallet.\nTeam {team_num} is now active for {MATCHES[match_id]['name']}.", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='Markdown')
+        bot.answer_callback_query(call.id, "Match Joined!")
+    except Exception as e:
+        logging.error(f"Wallet pay error: {e}")
+        bot.answer_callback_query(call.id, "Error processing wallet payment.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "ready_screenshot")
+def callback_ready_screenshot(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,
+        "📸 *Screenshot भेजो!*\n\nफोटो या document भेज सकते हो\n\n👇 नीचे भेजो:",
+        parse_mode='Markdown')
+
+@bot.message_handler(content_types=['photo', 'document'])
+def handle_screenshot(msg):
+    uid = str(msg.from_user.id)
+    user = db.db_get_user(uid)
+    
+    if not user:
+        bot.reply_to(msg, "❌ Account नहीं है!")
+        return
+
+    # Check database for pending intent instead of relying on in-memory dictionary
+    # This prevents errors if the bot restarts while a user is making a payment
+    with db.get_db() as conn:
+        conn.execute(
+            "SELECT * FROM PAYMENT_INTENTS WHERE user_id=%s AND status='pending' AND expires_at > %s ORDER BY id DESC LIMIT 1",
+            (uid, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        intent = conn.fetchone()
+
+    if not intent:
+        bot.reply_to(msg, "❌ *No Active Payment Request:* Pehle 'ADD MONEY' ya contest join button dabayein.")
+        return
+
+    active_context = intent['match_context']
+    parts = active_context.split("_")
+    match_id, team_num = parts[0], parts[1]
+    amount = intent['amount']
+
+    if match_id != "wallet":
+        team = db_get_team(uid, match_id, int(team_num)) or {}
+    else:
+        team = None
+    
+    file_id = msg.photo[-1].file_id if msg.content_type == 'photo' else msg.document.file_id
+    file_type = "photo" if msg.content_type == 'photo' else "document"
+    
+    # Anti-Scam: Check if this exact file was already submitted
+    with db.get_db() as conn:
+        conn.execute("SELECT id FROM PAYMENTS WHERE upi_txn_id=%s", (file_id,))
+        duplicate_file = conn.fetchone()
+        if duplicate_file:
+            bot.reply_to(msg, "❌ Yeh screenshot pehle hi submit kiya ja chuka hai! Scam karne ki koshish na karein.")
+            logging.warning(f"Fraud Alert: User {uid} tried to resubmit same file {file_id}")
+            return
+
+    try:
+        with db.get_db() as conn:
+            conn.execute(
+                "INSERT INTO PAYMENTS (user_id, amount, match_id, upi_txn_id, timestamp, status) VALUES (%s, %s, %s, %s, %s, 'pending')",
+                (uid, amount, match_id, file_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            )
+    except Exception as e:
+        logging.error(f"Error saving screenshot info: {e}")
+    
+    bot.send_message(msg.chat.id,
+        "✅ *Screenshot Received!*\n\n⏳ Admin verify करेगा 5-10 minutes में",
+        parse_mode='Markdown')
+    
+    team_info = ""
+    if team:
+        for role in ['bat', 'wk', 'ar', 'bowl']:
+            players = team.get(role, [])
+            if players:
+                team_info += f"\n{ROLE_NAMES[role]}: {', '.join(players)}"
+    
+    if match_id == "wallet":
+        caption = f"💰 WALLET DEPOSIT\n👤 User: {user['first_name']}\n🆔 ID: {uid}\n💰 ₹{amount}"
+    else:
+        match_name = MATCHES.get(match_id, {}).get('name', match_id)
+        caption = f"👤 User: {user['first_name']}\n🆔 ID: {uid}\n🏏 Match: {match_name}\n⚾ Team: {team_num}\n💰 ₹{amount}{team_info}"
+
+    # 📜 Fetch Last 3 Payment History to help Admin spot scammers
+    history = db.db_get_user_payment_history(uid, limit=3)
+    history_text = "\n\n📋 *RECENT PAYMENTS (History):*"
+    if history:
+        for h in history:
+            status_icon = "✅" if h['status'] == 'completed' else "❌" if h['status'] == 'rejected' else "⏳"
+            history_text += f"\n{status_icon} ₹{h['amount']} | {h['timestamp'][5:16]}"
+    else:
+        history_text += "\nNo previous records."
+    
+    caption += history_text
+    
+    admin_markup = types.InlineKeyboardMarkup(row_width=3)
+    admin_markup.add(
+        types.InlineKeyboardButton("✅ APPROVE", callback_data=f"approve_{uid}_{match_id}_{team_num}"),
+        types.InlineKeyboardButton("❌ REJECT", callback_data=f"reject_{uid}"),
+        types.InlineKeyboardButton("🚩 RED FLAG", callback_data=f"adm_flag_manual_{uid}")
+    )
+
+    pay_chan = get_payment_channel()
+    if file_type == "photo":
+        bot.send_photo(pay_chan, file_id, caption=caption, reply_markup=admin_markup)
+    else:
+        bot.send_document(pay_chan, file_id, caption=caption, reply_markup=admin_markup)
+
+
+@bot.message_handler(func=lambda m: m.text and len(m.text) == 12 and m.text.isdigit())
+def handle_utr_input(msg):
+    """Auto-Verification Engine for UTR numbers"""
+    uid = str(msg.from_user.id)
+    utr = msg.text.strip()
+
+    # 1. Check if user is already blocked/flagged
+    user = db.db_get_user(uid)
+    if user and user['is_flagged']:
+        markup = types.InlineKeyboardMarkup()
+        s_handle = get_support_handle()
+        markup.add(types.InlineKeyboardButton("📞 CONTACT SUPPORT", url=f"https://t.me/{s_handle.replace('@', '')}"))
+        bot.reply_to(msg, "⚠️ *ACCOUNT UNDER REVIEW*\n\nAapke account par sandigdh activity payi gayi hai. Admin verify kar raha hai. Agar aapko lagta hai yeh galti hai, toh support se baat karein.", reply_markup=markup, parse_mode='Markdown')
+        return
+
+    with db.get_db() as conn:
+        # 2. Duplicate Check (Anti-Scam)
+        conn.execute("SELECT user_id FROM USED_UTR WHERE utr=%s", (utr,))
+        used = conn.fetchone()
+        if used:
+            bot.reply_to(msg, "❌ *FRAUD DETECTED:* Yeh UTR pehle hi istemal ho chuka hai! Aapka attempt record kar liya gaya hai.", parse_mode='Markdown')
+            db.db_log_failed_utr(uid, utr)
+            
+            failed_count = db.db_get_failed_utr_count(uid)
+            if failed_count >= 3:
+                db.db_flag_user(uid)
+                bot.send_message(get_payment_channel(), f"🚩 *RED FLAG:* User {uid} ne 3+ duplicate UTR bheje hain. Account flag kar diya gaya hai.")
+            return
+
+        # 3. Active Order Intent Check
+        # Agar user ne 'Add Money' nahi dabaya aur seedha UTR bhej raha hai
+        conn.execute(
+            "SELECT * FROM PAYMENT_INTENTS WHERE user_id=%s AND status='pending' AND expires_at > %s ORDER BY id DESC LIMIT 1",
+            (uid, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        intent = conn.fetchone()
+
+        if not intent:
+            # Log as failed attempt for "random" UTR input
+            db.db_log_failed_utr(uid, utr)
+            failed_count = db.db_get_failed_utr_count(uid)
+            
+            if failed_count >= 3:
+                db.db_flag_user(uid)
+                bot.reply_to(msg, "⚠️ *RED FLAG:* Baar-baar galat UTR bhejne ke karan aapka account review mein daal diya gaya hai.")
+                bot.send_message(get_payment_channel(), f"🚩 *RED FLAG:* User {uid} ko random UTR spamming ke liye flag kiya gaya hai.")
+            else:
+                pending_amt = db.db_get_user_state(uid, 'deposit_amount') or "required"
+                bot.reply_to(msg, f"❌ *No Active Order:* Pehle 'ADD MONEY' par click karein aur ₹{pending_amt} pay karein, uske baad UTR bhein.\n\n⚠️ Caution: Galat UTR par ID block ho sakti hai. (Attempts left: {3-failed_count})")
+            return
+
+        # 4. Success Flow
+        try:
+            user_info = db.db_get_user(uid) or {"first_name": "User"}
+            # Save to used_utr first (Primary Key will block concurrent duplicates)
+            conn.execute("INSERT INTO USED_UTR (utr, user_id, amount, timestamp) VALUES (%s, %s, %s, %s)",
+                         (utr, uid, intent['amount'], datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            
+            # Update Ledger & Activation
+            success, res_msg = process_payment_success(uid, intent['amount'], f"UTR_{utr}", intent['match_context'], conn=conn)
+            
+            if success:
+                now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                conn.execute("UPDATE PAYMENT_INTENTS SET status='completed' WHERE id=%s", (intent['id'],))
+                bot.reply_to(msg, f"✅ *UTR VERIFIED!*\n\n₹{intent['amount']} added to wallet.\nRef: {utr}", parse_mode='Markdown')
+                
+                # 📊 Sync to Google Sheets (Auto-completed)
+                sheets.sync_wrapper({
+                    "user_id": uid,
+                    "amount": intent['amount'],
+                    "upi_txn_id": utr,
+                    "timestamp": now_ts,
+                    "status": "completed"
+                }, "PAYMENTS")
+                
+                # 🔔 Admin Notification for Auto-Payment with History
+                history = db.db_get_user_payment_history(uid, limit=3)
+                hist_text = "\n".join([f"{'✅' if h['status']=='completed' else '❌'} ₹{h['amount']} ({h['timestamp'][5:16]})" for h in history])
+                
+                admin_markup = types.InlineKeyboardMarkup()
+                admin_markup.add(
+                    types.InlineKeyboardButton("🚩 FAKE / REVERT & RED FLAG", callback_data=f"adm_revert_{uid}_{utr}_{intent['amount']}")
+                )
+
+                admin_alert = (
+                    f"💰 *AUTO-PAYMENT SUCCESS (UTR)*\n\n👤 User: {user_info['first_name']}\n🆔 ID: `{uid}`\n"
+                    f"💵 Amount: ₹{intent['amount']}\n🔢 UTR: `{utr}`\n\n⚠️ *Action:* Check Bank Statement. If fake, click button below to ban.\n\n📜 *Last 3 Payments:*\n{hist_text if history else 'No records'}"
+                )
+                bot.send_message(get_payment_channel(), admin_alert, reply_markup=admin_markup, parse_mode='Markdown')
+            else:
+                bot.reply_to(msg, f"❌ Error: {res_msg}")
+        except Exception:
+            bot.reply_to(msg, "❌ Duplicate UTR detected.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
+def callback_approve(call):
+    parts = call.data.split("_")
+    uid, mid, tnum = parts[1], parts[2], parts[3]
+    bot.answer_callback_query(call.id)
+
+    with db.get_db() as conn:
+        conn.execute("SELECT amount, id, upi_txn_id, timestamp FROM PAYMENTS WHERE user_id=%s AND match_id=%s AND status='pending' ORDER BY timestamp DESC", (uid, mid))
+        pay_row = conn.fetchone()
+        if not pay_row:
+            bot.edit_message_caption(caption="❌ No pending request found.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+            return
+
+        amount = pay_row['amount']
+        ref = f"MANUAL_{pay_row['id']}_{int(time.time())}"
+        
+        success, _ = process_payment_success(uid, amount, ref, f"{mid}_{tnum}", conn=conn)
+        if success:
+            conn.execute("UPDATE PAYMENTS SET status='completed' WHERE id=%s", (pay_row['id'],))
+            
+            # 📊 Sync Update to Google Sheets
+            sheets.sync_wrapper({
+                "user_id": uid,
+                "amount": amount,
+                "upi_txn_id": pay_row['upi_txn_id'],
+                "timestamp": pay_row['timestamp'],
+                "status": "completed"
+            }, "PAYMENTS")
+            
+            bot.send_message(uid, f"🎉 *PAYMENT APPROVED!*\n₹{amount} credited to ledger.", parse_mode='Markdown')
+            bot.edit_message_caption(caption=f"✅ APPROVED (₹{amount})", chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_"))
+def callback_reject(call):
+    uid = call.data.split("_")[1]
+    bot.answer_callback_query(call.id)
+    
+    try:
+        with db.get_db() as conn:
+            # Fetch info before update for sheet sync
+            conn.execute("SELECT amount, upi_txn_id, timestamp FROM PAYMENTS WHERE user_id=%s AND status='pending' ORDER BY timestamp DESC LIMIT 1", (uid,))
+            pay_row = conn.fetchone()
+            
+            conn.execute("UPDATE PAYMENTS SET status='rejected' WHERE user_id=%s AND status='pending'", (uid,))
+        
+        user = db.db_get_user(uid)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("💳 TRY AGAIN", callback_data="init_deposit"))
+
+        if pay_row:
+            # 📊 Sync Update to Google Sheets
+            sheets.sync_wrapper({
+                "user_id": uid,
+                "amount": pay_row['amount'],
+                "upi_txn_id": pay_row['upi_txn_id'],
+                "timestamp": pay_row['timestamp'],
+                "status": "rejected"
+            }, "PAYMENTS")
+
+        warning_msg = "⚠️ *PAYMENT REJECTED & WARNING*\n\nAapka payment reject kar diya gaya hai. Kripya sahi screenshot aur details bhein. Baar-baar galat details bhejne par aapka account restrict kiya ja sakta hai."
+        bot.send_message(uid, warning_msg, reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_caption(f"❌ REJECTED & WARNED\nUser: {user['first_name']}", call.message.chat.id, call.message.message_id)
+    except Exception as e:
+        logging.error(f"Error in callback_reject: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_act_unflag_"))
+def callback_unflag_user(call):
+    """Admin can unflag a user to allow transactions again"""
+    if str(call.from_user.id) != ADMIN_ID: return
+    uid = call.data.split("_")[3]
+    try:
+        db.db_flag_user(uid, status=0)
+        bot.answer_callback_query(call.id, "User account cleared!", show_alert=True)
+        bot.send_message(uid, "✅ *ACCOUNT VERIFIED*\n\nAapka account verify ho gaya hai. Ab aap transactions aur contests join kar sakte hain.", parse_mode='Markdown')
+        
+        # Update Admin UI
+        markup, text = ui.admin_fraud_render(db.get_fraud_list())
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Unflag error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_act_block_"))
+def callback_block_user(call):
+    """Admin can permanently flag a user and warn them"""
+    if str(call.from_user.id) != str(ADMIN_ID): return
+    uid = call.data.split("_")[3]
+    try:
+        db.db_flag_user(uid, status=1)
+        bot.answer_callback_query(call.id, "User Blocked/Flagged!", show_alert=True)
+        bot.send_message(uid, "🚫 *ACCESS RESTRICTED*\n\nAapke account par sandigdh activity ke karan transactions rok di gayi hain.", parse_mode='Markdown')
+        
+        markup, text = ui.admin_fraud_render(db.get_fraud_list())
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Block error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_revert_"))
+def callback_revert_fake(call):
+    """Admin can revert a fake UTR payment and ban the user instantly"""
+    if str(call.from_user.id) != ADMIN_ID: return
+    
+    parts = call.data.split("_")
+    uid, utr, amount = parts[2], parts[3], float(parts[4])
+    
+    try:
+        with db.get_db() as conn:
+            # 1. Flag the user as fraud
+            conn.execute("UPDATE USERS SET is_flagged = 1 WHERE user_id = %s", (uid,))
+            
+            # 2. Debit the balance (Reverse the credit)
+            ref_id = f"REVERT_{utr}"
+            # Check if already reverted
+            conn.execute("SELECT id FROM LEDGER WHERE reference_id=%s", (ref_id,))
+            exists = conn.fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                    (uid, -amount, ref_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                )
+            
+            # 3. If it was for a match, mark team as unpaid
+            conn.execute("UPDATE TEAMS SET is_paid = 0 WHERE user_id = %s AND is_paid = 1", (uid,))
+            
+        bot.answer_callback_query(call.id, "User Banned & Balance Reverted!", show_alert=True)
+        bot.edit_message_caption(
+            caption=call.message.caption + "\n\n🚩 *ACTION: REVERTED & RED FLAGGED*",
+            chat_id=get_payment_channel(),
+            message_id=call.message.message_id
+        )
+        bot.send_message(uid, "⚠️ *ACCOUNT RED FLAGGED*\n\nAapka fake payment UTR record kiya gaya hai. Balance revert kar diya gaya hai aur account review mein hai.", parse_mode='Markdown')
+        
+    except Exception as e:
+        logging.error(f"Revert error: {e}")
+        bot.answer_callback_query(call.id, "Error during revert.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_flag_manual_"))
+def callback_red_flag_manual(call):
+    if str(call.from_user.id) != ADMIN_ID: return
+    uid = call.data.split("_")[3]
+    try:
+        db.db_flag_user(uid)
+        bot.answer_callback_query(call.id, "User Red Flagged!", show_alert=True)
+        bot.edit_message_caption(
+            caption=call.message.caption + "\n\n🚩 *STATUS: RED FLAGGED BY ADMIN*",
+            chat_id=get_payment_channel(),
+            message_id=call.message.message_id
+        )
+        bot.send_message(uid, "⚠️ *ACCOUNT UNDER REVIEW*\n\nAapke transactions mein gadbadi payi gayi hai. Aapka account review mein daal diya gaya hai. Support se sampark karein.", parse_mode='Markdown')
+        # Clear any pending payments for this user
+        with db.get_db() as conn:
+            conn.execute("UPDATE PAYMENTS SET status='rejected' WHERE user_id=%s AND status='pending'", (uid,))
+    except Exception as e:
+        logging.error(f"Manual flag error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "payment_cancel")
+def callback_payment_cancel(call):
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text("❌ Cancelled", call.message.chat.id, call.message.message_id)
+
+# ===================================================
+# MENU
+# ===================================================
+
+@bot.message_handler(commands=['leaderboard'])
+@bot.message_handler(func=lambda m: m.text and "LEADERBOARD" in m.text)
+def cmd_leaderboard(msg):
+    rows = get_leaderboard(10)
+    text = "🏆 *TOP 10*\n\n"
+    
+    if not rows:
+        text += "No scores yet!"
+    else:
+        for i, row in enumerate(rows, 1):
+            username = row['username'] or row['first_name']
+            points = row['points'] or 0
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
+            text += f"{medal} @{username} - {points}\n"
+    
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['wallet'])
+@bot.message_handler(func=lambda m: m.text and "WALLET" in m.text)
+def cmd_wallet(msg):
+    uid = str(msg.from_user.id)
+    user = db.db_get_user(uid)
+    
+    if not user:
+        bot.send_message(msg.chat.id, "❌ No account!")
+        return
+    
+    balance = db.db_get_wallet_balance(uid)
+
+    # 🔗 Referral Link Generation
+    bot_info = bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref{uid}"
+
+    text = (
+        "💰 *Wallet*\n\n"
+        f"Balance: *₹{balance}*\n\n"
+        "➕ Add Money\n"
+        "💸 Withdraw\n"
+        "🎁 Refer & Earn\n\n"
+        f"⚠️ Min Withdraw: ₹{MIN_WITHDRAWAL}\n\n"
+        "👉 *Next: Add Money to join paid contests*"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("➕ Add Money", callback_data="init_deposit"),
+        types.InlineKeyboardButton("💸 Withdraw", callback_data="req_withdraw"),
+        types.InlineKeyboardButton("🎁 Refer & Earn", switch_inline_query=f"Join & Win: {ref_link}"),
         types.InlineKeyboardButton("🏠 Home", callback_data="app_home")
     )
     
-    body = f"🏟 *MATCH:* {match_name}\n\n{rank_text}"
-    return markup, body
+    bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
 
-def lock_screen_markup():
+@bot.callback_query_handler(func=lambda call: call.data == "init_deposit")
+def callback_init_deposit(call):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🏠 Return Home", callback_data="app_home"))
-    return markup, "🔒 *MATCH LOCKED*\n\nThe deadline has passed. Team editing is disabled. Live points are being calculated."
+    markup.add(types.InlineKeyboardButton("❌ CANCEL PAYMENT", callback_data="payment_cancel"))
+    sent = bot.send_message(call.message.chat.id, "💰 *Enter amount* to add to your wallet:\n(Min: ₹10, Max: ₹50,000)", reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_deposit_input)
 
-def admin_match_finance_render(match_id, match_name, fin_data):
-    comm_pct = float(db.db_get_setting('PRIZE_COMMISSION', 10))
-    total_collection = fin_data['collection']
-    admin_cut = (total_collection * comm_pct) / 100
-    prize_pool = total_collection - admin_cut
+# ADD 1: Transaction History
+@bot.callback_query_handler(func=lambda call: call.data == "show_history")
+@bot.message_handler(commands=['history'])
+def cmd_history(msg_or_call):
+    is_cb = isinstance(msg_or_call, telebot.types.CallbackQuery)
+    msg = msg_or_call.message if is_cb else msg_or_call
+    uid = str(msg_or_call.from_user.id)
     
-    res = (
-        f"💰 *FINANCIAL SUMMARY: {match_name}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Total Collection: `₹{total_collection}`\n"
-        f"✂️ Admin Cut ({comm_pct}%): `₹{admin_cut}`\n"
-        f"🎁 Total Prize Pool: `₹{prize_pool}`\n"
-        f"👥 Paid Entries: `{fin_data['entries']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *PRIZE BREAKDOWN (Per Contest Type):*\n"
-    )
+    history = db.db_get_transaction_history(uid)
+    if not history:
+        text = "📜 *Transaction History*\n\nAapne abhi tak koi transaction nahi ki hai."
+    else:
+        text = "📜 *Last 10 Transactions*\n\n"
+        for item in history:
+            sign = "✅ +" if item['type'] == 'CREDIT' else "❌ -"
+            date = item['timestamp'][5:16] # Format: 04-24 19:30
+            text += f"`{date}` | {sign}₹{abs(item['amount'])} | {item['reference_id'][:12]}...\n"
     
-    for cfg in fin_data['configs']:
-        bd = get_prize_breakdown(cfg['entry_fee'], cfg['max_slots'])
-        res += (
-            f"\n📍 *Contest ₹{cfg['entry_fee']} ({cfg['max_slots']} slots):*\n"
-            f"🥇 1st: ₹{bd['1st']} | 🥈 2nd: ₹{bd['2nd']}\n"
-            f"🥉 3rd: ₹{bd['3rd']} | 🏅 4-10: ₹{bd['4-10']}\n"
-        )
+    if is_cb: bot.answer_callback_query(msg_or_call.id)
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_fin_{match_id}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="adm_nav_home"))
-    return markup, res
-
-def admin_dashboard_home(stats, matches):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    fraud_btn_text = f"⚠️ Fraud Alerts ({stats['flagged']})" if stats['flagged'] > 0 else "⚠️ Fraud Alerts"
-    markup.add(
-        types.InlineKeyboardButton("📊 Funnel", callback_data="adm_nav_funnel"),
-        types.InlineKeyboardButton("🔗 Referrals", callback_data="adm_nav_refs"),
-        types.InlineKeyboardButton(fraud_btn_text, callback_data="adm_nav_fraud"),
-        types.InlineKeyboardButton("🏆 Leaderboard", callback_data="adm_nav_lead"),
-        types.InlineKeyboardButton("❓ Commands Help", callback_data="adm_nav_help"),
-        types.InlineKeyboardButton("🔄 Refresh Data", callback_data="adm_nav_home")
+# ADD 3: Referral Dashboard
+@bot.message_handler(commands=['myreferrals'])
+def cmd_my_referrals(msg):
+    uid = str(msg.from_user.id)
+    stats = db.db_get_referral_stats(uid)
+    text = (
+        "🎁 *Referral Dashboard*\n\n"
+        f"👥 Total Referrals: `{stats['total']}`\n"
+        f"💰 Total Bonus Earned: `₹{stats['bonus']}`\n\n"
+        "Aapka referral bonus tabhi credit hoga jab aapka referral pehla contest join karega!"
     )
-    # Add match control buttons
-    markup.add(types.InlineKeyboardButton("--- Match Controls ---", callback_data="ignore_match_control_header"))
-    for mid, info in matches.items():
-        markup.row(
-            types.InlineKeyboardButton(f"🎮 Control: {info['name']}", callback_data=f"adm_ctrl_{mid}"),
-            types.InlineKeyboardButton("💰 Finance", callback_data=f"adm_fin_{mid}")
-        )
-    markup.add(types.InlineKeyboardButton("🔙 EXIT ADMIN", callback_data="app_home"))
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+def process_deposit_input(msg):
+    uid = str(msg.from_user.id)
+    if not msg.text.isdigit():
+        bot.send_message(msg.chat.id, "❌ Invalid amount! Please enter numbers only.")
+        return
+    
+    amount = int(msg.text)
+    if amount < 10:
+        bot.send_message(msg.chat.id, "❌ Minimum deposit ₹10.")
+        return
+        
+    bot.send_message(msg.chat.id, f"✅ *Amount Confirmed:* ₹{amount}")
+    send_payment_ui(msg.chat.id, uid, amount, "wallet", "0")
+
+@bot.message_handler(commands=['withdraw'])
+def cmd_withdraw(msg):
+    uid = str(msg.from_user.id)
+    user = db.db_get_user(uid)
+    if not user:
+        bot.reply_to(msg, "❌ Account nahi mila!")
+        return
+    balance = db.db_get_wallet_balance(uid)
+    if balance < MIN_WITHDRAWAL:
+        bot.reply_to(msg, f"❌ Minimum ₹{MIN_WITHDRAWAL} hone chahiye!")
+        return
     
     text = (
-        "📊 *ADMIN DASHBOARD*\n"
-        "━━━━━━━━━━━━━━\n"
-        f"👥 Users: `{stats['total']}` | 🟢 Live: `{stats['active']}`\n"
-        f"🆕 Today: `{stats['new']}` | 🚨 Fraud: `{stats['flagged']}`\n"
-        "━━━━━━━━━━━━━━\n"
-        f"💳 Paid: `{stats['paid']}` | 📈 Conv: `{stats['conv']}%`\n"
-        "━━━━━━━━━━━━━━\n"
-        "🔄 _Click Refresh for updates_"
+        "🏧 *WITHDRAWAL REQUEST*\n\n"
+        f"💰 Aapka Balance: ₹{balance}\n"
+        f"⚠️ Minimum Withdrawal: ₹{MIN_WITHDRAWAL}\n\n"
+        "Niche diye gaye format mein apni UPI ID aur Amount bhejien:\n"
+        "`UPI_ID AMOUNT`\n\n"
+        "Example: `binod@oksbi 500`"
     )
-    return markup, text
+    sent_msg = bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent_msg, process_withdrawal_details)
 
-def admin_help_render():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 BACK TO DASHBOARD", callback_data="adm_nav_home"))
-    
-    text = """
-🛠 *ADMIN MASTER CONTROL GUIDE*
-━━━━━━━━━━━━━━━━━━━━
+def process_withdrawal_details(msg):
+    uid = str(msg.from_user.id)
+    try:
+        # SEC 2: Sanitize and parse
+        clean_text = sanitize_input(msg.text, 100)
+        parts = clean_text.split()
+        if len(parts) < 2:
+            bot.reply_to(msg, "❌ Format galat hai! Dubara `/withdraw` dabayein aur is tarah bhejien:\n`UPI_ID AMOUNT`", parse_mode='Markdown')
+            return
+        
+        upi_id, amount = parts[0], float(parts[1])
+        balance = db.db_get_wallet_balance(uid)
 
- *CORE CONTROLS*
-• `/admin_panel` - Dashboard open karein
-• `/broadcast` - Sabhi users ko message ya photo bhein
-• `/export_data` - Pura backup CSV format mein lein
+        if amount < MIN_WITHDRAWAL:
+            bot.reply_to(msg, f"❌ Minimum withdrawal ₹{MIN_WITHDRAWAL} hai.")
+            return
+        if amount > balance:
+            bot.reply_to(msg, f"❌ Insufficient balance! Aapke paas ₹{balance} hain.")
+            return
 
-🏏 *MATCH & PLAYER MANAGEMENT*
-• `/add_match` - Naya match create karein
-  _Ex: m1 | CSK vs MI | IPL | 2026-05-01 19:30_
-• `/add_player` - Players add karein (Bulk ya Single)
-• `/delete_player` - Player ko match se hatayein
-• `/my_matches` - Matches list aur manage karein
-• `/list_players m1` - Players list dekhne ke liye
-
-🏆 *CONTESTS & PRIZES*
-• `/set_contest_size` - Contest config set karein
-  _Ex: m1 | 100 | 50_ (fee | slots)
-• `/delete_contest` - Kisi contest ko remove karein
-• `/set_prize_config` - Global prize logic (Commission | Win% | R1 | R2 | R3)
-
-📈 *LIVE SCORING (REAL-TIME)*
-• `/up` - Fast point update (Ex: /up Kohli 50)
-• `/update_points` - Bulk update (Ex: /up m1 | Kohli:50, Dhoni:20)
-• `/myrank` - Kisi bhi match ka live rank check karein
-
-⚙️ *SYSTEM SETTINGS*
-• `/set_handle` - Support/Channel/Channel IDs update karein
-• `/rules` - Scoring system aur multipliers dekhein
-• `/clear_database` - ⚠️ Purana test data saaf karein
-━━━━━━━━━━━━━━━━━━━━
-💡 _Sare commands direct chat mein type karein ya Dashboard buttons ka use karein._"""
-    return markup, text
-
-def admin_funnel_render(funnel_counts):
-    steps = ["Start", "Team Init", "Team Save", "Payment"]
-    max_val = funnel_counts[0] if funnel_counts[0] > 0 else 1
-    
-    res = "📈 *USER CONVERSION FUNNEL*\n━━━━━━━━━━━━━━━━━━━━\n"
-    for i, count in enumerate(funnel_counts):
-        perc = int((count / max_val) * 100)
-        bar_len = int(perc / 10)
-        bar = "🟩" * bar_len + "⬜" * (10 - bar_len)
-        res += f"*{steps[i]}*\n`{bar}` {perc}%\n(Count: {count})\n\n"
-    
-    drop_off = 100 - int((funnel_counts[-1] / max_val) * 100) if max_val > 0 else 0
-    res += f"📉 *Overall Drop-off:* `{drop_off}%`"
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_nav_home"))
-    return markup, res
-
-def admin_fraud_render(fraud_list):
-    res = "⚠️ *FRAUD DETECTION PANEL*\n━━━━━━━━━━━━━━━━━━━━\n"
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    if not fraud_list:
-        res += "✅ No high-risk users detected."
-    else:
-        for user in fraud_list:
-            risk_icon = "🔴" if user['utr_count'] > 10 else "🟡"
-            res += f"{risk_icon} *{user['first_name']}*\n`ID: {user['user_id']}`\nStatus: Flagged 🚩\n\n"
-            markup.row(
-                types.InlineKeyboardButton(f"🚫 Block", callback_data=f"adm_act_block_{user['user_id']}"),
-                types.InlineKeyboardButton(f"✅ Clear Flag", callback_data=f"adm_act_unflag_{user['user_id']}")
+        with db.get_db() as conn:
+            conn.execute(
+                "INSERT INTO WITHDRAWALS (user_id, amount, upi_id, timestamp) VALUES (%s, %s, %s, %s) RETURNING id",
+                (uid, amount, upi_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
-            
-    markup.add(types.InlineKeyboardButton("🔄 REFRESH LIST", callback_data="adm_nav_fraud"))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="adm_nav_home"))
-    return markup, res
+            req_id = conn.fetchone()['id']
 
-def admin_referral_render(top_refs):
-    res = "🔗 *REFERRAL INTELLIGENCE*\n━━━━━━━━━━━━━━━━━━━━\n"
-    if not top_refs:
-        res += "No referral data available."
-    else:
-        for i, ref in enumerate(top_refs, 1):
-            res += f"{i}. `ID:{ref[0]}` ➔ *{ref[1]} Invites*\n"
-            
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_nav_home"))
-    return markup, res
+        # 📊 Sync to Google Sheets (Withdrawal Request)
+        sheets.sync_wrapper({
+            "user_id": uid,
+            "amount": amount,
+            "upi_id": upi_id,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "status": "pending"
+        }, "WITHDRAWALS")
 
-def payment_instructions_render(order_id, amount, upi_id):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(f"📋 Copy UPI: {upi_id}", callback_data=f"copy_upi_{upi_id}"),
-        types.InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_confirm_{order_id}"),
-        types.InlineKeyboardButton("❌ CANCEL ORDER", callback_data="app_home")
-    )
-    text = f"""
-💳 *SECURE PAYMENT*
-━━━━━━━━━━━━━━
-💰 Amount: *₹{amount}*
-🆔 Order ID: `{order_id}`
-━━━━━━━━━━━━━━
-1️⃣ UPI par payment karein.
-2️⃣ **12-digit UTR** yahan bhein ⚡
-3️⃣ Ya screenshot bhein ⏳
-━━━━━━━━━━━━━━
-⚠️ Expiry: 60 mins
-"""
-    return markup, text
+        bot.reply_to(msg, f"✅ *Request Submitted!*\n💰 Amount: ₹{amount}\n🏦 UPI: `{upi_id}`\n\nAdmin 10-15 minute mein verify karke paise bhej dega aur payment ka screenshot yahi share karega.")
 
-def contest_list_render(matches):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    now = datetime.now()
+        # Admin notification with buttons
+        admin_markup = types.InlineKeyboardMarkup()
+        admin_markup.add(
+            types.InlineKeyboardButton("✅ APPROVE", callback_data=f"wd_approve_{req_id}"),
+            types.InlineKeyboardButton("❌ REJECT", callback_data=f"wd_reject_{req_id}"),
+            types.InlineKeyboardButton("➡️ SENT", callback_data=f"wd_sent_{req_id}")
+        )
+        bot.send_message(get_payment_channel(), f"🔔 *NEW WITHDRAWAL*\nUser: {msg.from_user.first_name}\nID: `{uid}`\nAmt: ₹{amount}\nUPI: `{upi_id}`", reply_markup=admin_markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Withdrawal input error: {e}")
+        bot.reply_to(msg, "❌ Error! Please enter amount correctly (e.g., binod@oksbi 500).")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wd_"))
+def callback_withdrawal_admin(call):
+    if str(call.from_user.id) != ADMIN_ID: return
+    parts = call.data.split("_")
+    action, req_id = parts[1], parts[2]
     
-    res = "🏆 *MATCHES*\n\n👉 *Next:* Select a match to join contests\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    for mid, info in matches.items():
-        deadline = info['deadline']
-        is_locked = now > deadline
-        time_left_delta = deadline - now
+    with db.get_db() as conn:
+        conn.execute("SELECT * FROM WITHDRAWALS WHERE id=%s", (req_id,))
+        req = conn.fetchone()
+        if not req or req['status'] not in ['pending', 'processing']: 
+            bot.answer_callback_query(call.id, "Already processed!")
+            return
 
-        status_icon = "🔒" if is_locked else "⏳"
-
-        day_tag = "Today" if deadline.date() == now.date() else deadline.strftime('%d %b')
-        time_str = deadline.strftime('%I:%M %p')
+        if action == "approve":
+            # ADD 4: Stage -> Processing
+            db.db_update_withdrawal_status(req_id, 'processing')
+            bot.send_message(req['user_id'], "⏳ *Withdrawal Processing!*\n\nAapki request verify ho gayi hai, paise bhein ja rahe hain.")
+            bot.edit_message_text(f"⏳ Processing: ₹{req['amount']} to {req['user_id']}", get_payment_channel(), call.message.message_id)
         
-        btn_text = f"{status_icon} {info['name']}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"show_match_{mid}"))
-
-    res += "\n⚠️ *No team?* \n👉 Pehle team banao niche buttons se."
-    return markup, res
-
-def get_prize_breakdown(fee, slots, custom_comm=None):
-    """Calculates distribution where ~70% of players win"""
-    # Fetch dynamic settings from DB with defaults
-    comm_val = float(custom_comm) if custom_comm is not None else float(db.db_get_setting('PRIZE_COMMISSION', 10))
-    win_pct = float(db.db_get_setting('PRIZE_WINNERS_PCT', 70))
-    r1_pct = float(db.db_get_setting('PRIZE_R1_PCT', 35))
-    r2_pct = float(db.db_get_setting('PRIZE_R2_PCT', 20))
-    r3_pct = float(db.db_get_setting('PRIZE_R3_PCT', 12))
-
-    # Platform commission logic
-    commission_multiplier = (100 - comm_val) / 100
-    collection = fee * slots
-    pool = int(collection * commission_multiplier)
-    commission_amt = collection - pool
-    winners_count = int(slots * (win_pct / 100)) # Custom % winners
-
-    # 70% Winners Logic: 
-    # Ranks 11 to (70% of slots) get their entry fee back.
-    # Top 10 share the surplus.
-    
-    refund_winners = max(0, winners_count - 10)
-    refund_total = refund_winners * fee
-    
-    # Surplus calculation with safety check
-    surplus_pool = max(100, pool - refund_total)
-    
-    # Distribution of surplus among Top 10
-    # Ranks 4-10 share the remaining surplus after Top 3
-    top3_total_pct = r1_pct + r2_pct + r3_pct
-    remaining_pct = max(0, 100 - top3_total_pct)
-
-    prizes = {
-        "1st": int(surplus_pool * (r1_pct / 100)),
-        "2nd": int(surplus_pool * (r2_pct / 100)),
-        "3rd": int(surplus_pool * (r3_pct / 100)),
-        "4-10": int((surplus_pool * (remaining_pct / 100)) / 7)
-    }
-    return {
-        "collection": collection, "commission_amt": commission_amt, "comm_pct": comm_val,
-        "pool": pool, "winners": winners_count, 
-        "1st": prizes["1st"], "2nd": prizes["2nd"], "3rd": prizes["3rd"],
-        "4-10": prizes["4-10"], "bottom": fee, "bottom_range": f"11-{winners_count}"
-    }
-
-def prize_breakdown_render(match_id, fee, slots):
-    breakdown = get_prize_breakdown(fee, slots)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}"))
-    
-    text = (
-        f"🏆 *PRIZE BREAKUP (₹{fee} Contest)*\n"
-        f"👥 Total Slots: {slots} | 💰 Pool: ₹{breakdown['pool']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🥇 *Rank 1:* ₹{breakdown['1st']}\n"
-        f"🥈 *Rank 2:* ₹{breakdown['2nd']}\n"
-        f"🥉 *Rank 3:* ₹{breakdown['3rd']}\n"
-        f"🏅 *Rank 4-10:* ₹{breakdown['4-10']} each\n"
-        f"🎖 *Rank {breakdown['bottom_range']}:* ₹{breakdown['bottom']} (Refund)\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✨ *Total Winners:* {breakdown['winners']} (70% of slots)\n"
-        f"⚠️ _Note: Prize pool calculation slots full hone par based hai._"
-    )
-    return markup, text
-
-def match_dashboard_render(match_id, info, stats, user_summary, time_left, contest_configs=None, entry_fee=100):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    deadline = info['deadline']
-    day_tag = "Today" if deadline.date() == datetime.now().date() else deadline.strftime('%d %b')
-    deadline_time = deadline.strftime('%I:%M %p')
-    
-    avail_spots = stats['max_slots'] - stats['joined']
-    
-    if contest_configs:
-        for cfg in contest_configs:
-            fee = cfg['entry_fee']
-            
-            # Custom labeling based on entry level
-            if fee >= 100: label = f"🥇 Mega ₹{fee}"
-            elif fee >= 50: label = f"🥈 Medium ₹{fee}"
-            else: label = f"🥉 Small ₹{fee}"
-
-            markup.row(types.InlineKeyboardButton(label, callback_data=f"join_{match_id}_{fee}"),
-                       types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_{fee}"))
-    else:
-        markup.row(types.InlineKeyboardButton("🏅 Join Mega ₹100", callback_data=f"join_{match_id}_100"),
-                   types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_100"))
-    
-    if not user_summary['saved']:
-        markup.add(types.InlineKeyboardButton("🏏 PEHLE TEAM BANAO", callback_data=f"team_slots_{match_id}_1"))
-    else:
-        markup.add(types.InlineKeyboardButton("⚾ MY TEAMS", callback_data=f"team_slots_{match_id}_1"))
-
-    markup.add(
-        types.InlineKeyboardButton("📊 Leaderboard", callback_data=f"app_match_{match_id}"),
-        types.InlineKeyboardButton("🏏 Player Stats", callback_data=f"show_player_stats_{match_id}")
-    )
-    markup.add(types.InlineKeyboardButton("🔙 Match List", callback_data="contest_list"))
-
-    text = f"""
-🏏 *{info['name']}*
-📅 {day_tag} • Deadline: {deadline_time}
-⏰ Time Left: {time_left}
-━━━━━━━━━━━━━━━━━━━━
-💰 *Prize Pool: ₹{stats['prize_pool']}*
-🎯 Entry: ₹{entry_fee}
-
-👥 {stats['joined']}/{stats['max_slots']} spots filled
-✅ {avail_spots} spots available
-━━━━━━━━━━━━━━━━━━━━
-👉 *Next: Team banao aur contest join karo!*"""
-    return markup, text
-
-def player_stats_render(match_id, match_name, stats, point_system):
-    res = f"📊 *PLAYER LIVE STATS: {match_name}*\n━━━━━━━━━━━━━━━━━━━━\n"
-    if not stats:
-        res += "_No stats recorded yet. Points update as soon as events occur._"
-    else:
-        for p in stats:
-            pts = (p['runs'] * point_system.get('run', 1) + 
-                   p['fours'] * point_system.get('four', 4) + 
-                   p['sixes'] * point_system.get('six', 6) + 
-                   p['wickets'] * point_system.get('wicket', 25))
-            res += f"👤 *{p['player_name']}*\n"
-            res += f"└ {p['runs']} runs | {p['fours']}x4 | {p['sixes']}x6 | {p['wickets']} wkts\n"
-            res += f"⭐ *Points:* `{int(pts)}` \n\n"
-            
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🔄 Refresh Score", callback_data=f"show_player_stats_{match_id}"),
-        types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}")
-    )
-    return markup, res
-
-def contest_selection_render(match_id, match_name):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🏅 Mega Contest (₹100) - 💎 High Prize", callback_data=f"sel_team_{match_id}_100"),
-        types.InlineKeyboardButton("🥈 Mid Contest (₹50) - 🔥 Low Comp", callback_data=f"sel_team_{match_id}_50"),
-        types.InlineKeyboardButton("🥉 Small Contest (₹20) - 🔰 Beginner", callback_data=f"sel_team_{match_id}_20"),
-        types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}")
-    )
-    text = f"🏆 *{match_name}* - Contest Selection\n\nChoose an entry level to compete. Each contest has different prize pools and competition levels."
-    return markup, text
-
-def team_points_breakdown_render(match_id, team_num, team_data, player_stats_map):
-    res = f"📊 *TEAM PERFORMANCE (T{team_num})*\n━━━━━━━━━━━━━━━━━━━━\n"
-    total = 0
-    for role in ['bat', 'wk', 'ar', 'bowl']:
-        p_list = team_data.get(role, [])
-        if not p_list: continue
-        res += f"\n*{role.upper()}*\n"
-        for p in p_list:
-            stats = player_stats_map.get(p, {'runs': 0, 'fours': 0, 'sixes': 0, 'wickets': 0})
-            raw_pts = (stats['runs'] * 1 + stats['fours'] * 4 + stats['sixes'] * 6 + stats['wickets'] * 25)
-            
-            mult = 1.0
-            tag = ""
-            if p == team_data.get('captain'): mult, tag = 2.0, "(C)"
-            elif p == team_data.get('vice_captain'): mult, tag = 1.5, "(VC)"
-            
-            p_final = int(raw_pts * mult)
-            total += p_final
-            res += f"👤 {p} {tag}\n"
-            res += f"└ {stats['runs']} R | {stats['wickets']} W | `{p_final} pts`\n"
-            
-    res += f"━━━━━━━━━━━━━━━━━━━━\n⭐ *Total Points: {total}*"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back to Team", callback_data=f"view_team_{match_id}_{team_num}"))
-    return markup, res
-
-def team_slot_picker_render(user_id, match_id, fee, db_helper):
-    markup = types.InlineKeyboardMarkup(row_width=4)
-    res = f"⚾ *JOIN CONTEST (₹{fee})*\n━━━━━━━━━━━━━━━━━━━━\n"
-    res += "Select a team slot to join with:\n\n"
-    
-    buttons = []
-    for i in range(1, 11): # Showing first 10 slots
-        status = db_helper(user_id, match_id, i)
-        if status == "paid":
-            icon, cb = "✅", f"already_joined"
-        elif status == "unpaid":
-            icon, cb = "❌", f"final_join_{match_id}_{i}_{fee}"
+        elif action == "sent":
+            # ADD 4: Final Stage -> Sent
+            ref = f"WD_REF_{req_id}"
+            conn.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                         (req['user_id'], -req['amount'], ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            db.db_update_withdrawal_status(req_id, 'sent')
+            bot.edit_message_text(f"✅ Sent: ₹{req['amount']} to {req['user_id']}", get_payment_channel(), call.message.message_id)
+            bot.send_message(req['user_id'], f"✅ *Sent to UPI!*\n₹{req['amount']} aapke account mein credit kar diye gaye hain.")
         else:
-            icon, cb = "⚪", f"nav_bat_{match_id}_{i}"
-        
-        buttons.append(types.InlineKeyboardButton(f"T{i}{icon}", callback_data=cb))
-        
-    markup.add(*buttons)
-    markup.add(types.InlineKeyboardButton("🔙 Back to Selection", callback_data=f"choose_contest_{match_id}"))
+            db.db_update_withdrawal_status(req_id, 'rejected')
+            bot.send_message(req['user_id'], f"❌ *Withdrawal Rejected*\nAapki ₹{req['amount']} ki request cancel kar di gayi hai.")
+            bot.edit_message_text(f"❌ Rejected: ₹{req['amount']} for {req['user_id']}", get_payment_channel(), call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(commands=['stats'])
+@bot.message_handler(func=lambda m: m.text and "STATS" in m.text)
+def cmd_stats(msg):
+    uid = str(msg.from_user.id)
+    user = db.db_get_user(uid)
     
-    res += "✅ Paid & Ready\n❌ Not Paid (Select to Join)\n⚪ Empty (Select to Create)"
-    return markup, res
+    # Dynamically find the first match the user has a team in
+    team = None
+    for mid in MATCHES.keys():
+        team = db.db_get_team_internal(uid, mid, 1)
+        if team: break
+    
+    if not user:
+        bot.send_message(msg.chat.id, "❌ No account!")
+        return
+    
+    points = team.get('points', 0) if team else 0
+    team_count = get_total_players(team) if team else 0
+    text = f"📊 *STATS*\n\n👤 {user['first_name']}\n⭐ Points: {points}\n🎯 Team: {team_count}/11"
+    
+    if team_count == 0:
+        text += "\n\n🚀 *Abhi tak koi team nahi hai!* \nJeetne ke liye apni pehli team banayein: /myteam"
+
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['help'])
+@bot.message_handler(func=lambda m: m.text and "HELP" in m.text)
+def cmd_help(msg):
+    # Clean handles properly for link generation
+    s_handle = get_support_handle()
+    c_handle = get_channel_handle().replace('@', '').replace('\\', '').strip()
+    
+    support_url = f"https://t.me/{s_handle}"
+    channel_url = f"https://t.me/{c_handle}"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🏏 Create Team", callback_data="cmd_my_team_nav"),
+        types.InlineKeyboardButton("🏆 Contests", callback_data="contest_list")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💰 Wallet", callback_data="app_wallet"),
+        types.InlineKeyboardButton("📊 My Rank", callback_data="app_myrank")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🎫 Support Ticket", callback_data="start_support"),
+        types.InlineKeyboardButton("📢 Main Channel", url=channel_url)
+    )
+    
+    if is_admin(msg.from_user.id):
+        markup.add(types.InlineKeyboardButton("🛠 ADMIN CONTROL GUIDE", callback_data="adm_nav_help"))
+    
+    help_text = f"""
+❓ <b>BOT FEATURES & COMMANDS</b>
+━━━━━━━━━━━━━━━━━━━━
+⚾ <b>Team Management:</b> /myteam - Team banayein aur edit karein.
+🏆 <b>Join Matches:</b> /contest - Available contests mein join karein.
+💰 <b>Wallet:</b> /wallet - Balance, Deposit, aur Withdrawal (/withdraw) manage karein.
+📊 <b>Live Rank:</b> /myrank - Live match ke waqt apna rank dekhein.
+📈 <b>User Stats:</b> /stats - Apni total performance dekhein.
+🎁 <b>Referrals:</b> /myreferrals - Apne referral bonus ki details dekhein.
+📜 <b>History:</b> /history - Apni transaction history dekhein.
+🏆 <b>Leaderboard:</b> /leaderboard - Top 10 users dekhein.
+⚖️ <b>Rules:</b> /rules - Scoring system samjhein.
+🎫 <b>Support:</b> /support - Kisi bhi problem ke liye ticket banayein.
+🚀 <b>Tour:</b> /start - Bot ka intro tour dobara dekhne ke liye.
+
+📞 <b>Official Support:</b> @{s_handle}
+"""
+    bot.send_message(msg.chat.id, help_text, reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
+
+@bot.message_handler(commands=['set_handle'])
+def cmd_set_handle(msg):
+    if str(msg.from_user.id) != ADMIN_ID: return
+
+    if "|" in msg.text:
+        msg.text = re.sub(r'^/\w+\s*', '', msg.text)
+        process_handle_setting(msg)
+        return
+
+    help_msg = (
+        "🛠 *ADMIN: SET SYSTEM HANDLES*\n\n"
+        "Format: `TYPE | VALUE` \n"
+        "Types: `SUPPORT`, `CHANNEL`, `PAYMENT_ID` \n\n"
+        "✅ Example: `SUPPORT | crick_support_help`"
+    )
+    sent = bot.send_message(msg.chat.id, help_msg, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_handle_setting)
+
+@bot.message_handler(commands=['support'])
+def cmd_support(msg):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ CANCEL", callback_data="support_cancel"))
+    sent = bot.send_message(msg.chat.id,
+        "🎫 *SUPPORT TICKET*\n\n"
+        "Apni problem likhkar bhejein:\n"
+        "(Payment issue, Team issue, kuch bhi)\n\n"
+        "👇 Niche type karo:",
+        reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_support_ticket)
+
+def process_support_ticket(msg):
+    uid = str(msg.from_user.id)
+    issue = sanitize_input(msg.text, max_len=500)
+    ticket_id = db.db_create_ticket(uid, issue)
+    
+    bot.reply_to(msg,
+        f"✅ *Ticket #{ticket_id} Created!*\n\n"
+        f"Admin jald hi reply karega.\n"
+        f"Ticket ID: <b>#{ticket_id}</b>",
+        parse_mode='HTML')
+    
+    # Admin ko notify karo with resolve button
+    admin_markup = types.InlineKeyboardMarkup()
+    admin_markup.add(
+        types.InlineKeyboardButton("💬 REPLY", callback_data=f"ticket_reply_{ticket_id}_{uid}"),
+        types.InlineKeyboardButton("✅ RESOLVE", callback_data=f"ticket_resolve_{ticket_id}_{uid}")
+    )
+    user = db.db_get_user(uid)
+    support_chan = get_support_channel()
+    bot.send_message(support_chan,
+        f"🎫 <b>NEW SUPPORT TICKET #{ticket_id}</b>\n\n"
+        f"👤 User: {html.escape(user['first_name'])}\n"
+        f"🆔 ID: <code>{uid}</code>\n\n"
+        f"📝 Issue:\n{html.escape(issue)}",
+        reply_markup=admin_markup, parse_mode='HTML')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ticket_reply_"))
+def callback_ticket_reply(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "🚫 Sirf Main Admin reply kar sakta hai!", show_alert=True)
+        return
+        
+    parts = call.data.split("_")
+    ticket_id, user_id = parts[2], parts[3]
+    orig_text = call.message.text # Original ticket ka text save kar lo
+    
+    try:
+        # 1. Pehle loading khatam karein
+        bot.answer_callback_query(call.id, "Type your reply now!")
+
+        # 2. State set karein (Strict Chat ID tracking)
+        ACTIVE_REPLY_STATE[int(call.message.chat.id)] = (ticket_id, user_id, call.message.message_id, orig_text)
+        
+        bot.send_message(call.message.chat.id,
+            f"💬 <b>Ticket #{ticket_id}</b> ka reply likho:\n\n"
+            f"Agla message jo aap bhein ge, wo seedha user ko chala jayega.",
+            parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Reply Trigger Error: {e}")
+        bot.answer_callback_query(call.id, "❌ Error: Prompt nahi bhej paya.", show_alert=True)
+
+@bot.message_handler(func=lambda m: int(m.chat.id) in ACTIVE_REPLY_STATE and not (m.text and m.text.startswith('💬')) and not (m.text and m.text.startswith('/')))
+@bot.channel_post_handler(func=lambda m: int(m.chat.id) in ACTIVE_REPLY_STATE and not (m.text and m.text.startswith('💬')) and not (m.text and m.text.startswith('/')))
+def handle_ticket_reply_intercept(msg):
+    """Admin ka reply intercept karega (Loop se bachne ke liye prompt messages ko ignore karega)"""
+    chat_id = int(msg.chat.id)
+    logging.info(f"📥 Intercepted reply in chat {chat_id}")
+    
+    data = ACTIVE_REPLY_STATE.pop(chat_id)
+    ticket_id, user_id, orig_msg_id, orig_text = data
+    send_ticket_reply(msg, ticket_id, user_id, orig_msg_id, orig_text, chat_id)
+
+def send_ticket_reply(msg, ticket_id, user_id, orig_msg_id, orig_text, chat_id):
+    if not msg.text:
+        bot.send_message(chat_id, "❌ Reply sirf text mein ho sakta hai.")
+        return
+
+    target_user = int(str(user_id).strip())
+    logging.info(f"🚀 Delivering reply for Ticket #{ticket_id} to User: {target_user}")
+
+    safe_reply = html.escape(msg.text)
+    safe_orig = html.escape(orig_text)
+
+    try:
+        # 1. User ko reply deliver karein
+        bot.send_message(target_user,
+            f"📩 <b>Support Reply — Ticket #{ticket_id}</b>\n\n"
+            f"{safe_reply}\n\n"
+            f"<i>Aur help chahiye? /support likhein</i>",
+            parse_mode='HTML')
+        
+        bot.send_message(chat_id, f"✅ Ticket #{ticket_id} ka reply user ko bhej diya gaya hai.")
+        logging.info(f"✅ Reply delivered to {target_user}")
+
+    except Exception as e:
+        logging.error(f"❌ Delivery failed: {e}")
+        bot.send_message(chat_id, f"⚠️ Delivery Error: User tak message nahi gaya (Shayad block kiya hai).")
+
+    # 2. Support Channel mein ticket update karein (Hamesha chale)
+    try:
+        new_markup = types.InlineKeyboardMarkup()
+        new_markup.add(types.InlineKeyboardButton("✅ RESOLVE", callback_data=f"ticket_resolve_{ticket_id}_{user_id}"))
+        
+        status_text = f"{safe_orig}\n\n✅ <b>REPLIED:</b> <i>{safe_reply[:60]}...</i>"
+        bot.edit_message_text(
+            status_text,
+            chat_id=chat_id,
+            message_id=int(orig_msg_id),
+            reply_markup=new_markup,
+            parse_mode='HTML'
+        )
+        logging.info(f"✅ Ticket UI updated.")
+    except Exception as e:
+        logging.error(f"❌ UI Update Error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ticket_resolve_"))
+def callback_ticket_resolve(call):
+    if not is_admin(call.from_user.id): return
+    parts = call.data.split("_")
+    ticket_id, user_id = parts[2], parts[3]
+    db.db_resolve_ticket(ticket_id)
+    bot.answer_callback_query(call.id, "Ticket Resolved!", show_alert=True)
+    bot.send_message(user_id,
+        f"✅ *Ticket #{ticket_id} Resolved!*\n\n"
+        f"Aapki problem solve ho gayi. "
+        f"Aur help ke liye /support karein.",
+        parse_mode='Markdown')
+    bot.edit_message_text(
+        call.message.text + "\n\n✅ *RESOLVED*",
+        call.message.chat.id, call.message.message_id,
+        parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "support_cancel")
+def callback_support_cancel(call):
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text("❌ Cancelled", call.message.chat.id, call.message.message_id)
+
+def process_handle_setting(msg):
+    """Admin input handle karne ke liye jo Support ya Channel badalta hai"""
+    try:
+        if "|" not in msg.text:
+            return bot.reply_to(msg, "❌ Invalid Format! Use `TYPE | VALUE`")
+        parts = [p.strip() for p in msg.text.split("|")]
+        # Proper Cleanup: Remove @ and backslashes in one go
+        h_type = parts[0].upper()
+        value = parts[1].replace("@", "").replace("\\", "").strip()
+        
+        if h_type == "SUPPORT":
+            db.db_set_setting('SUPPORT_HANDLE', value)
+            bot.reply_to(msg, f"✅ Support handle updated to: @{value}")
+        elif h_type == "CHANNEL":
+            db.db_set_setting('CHANNEL_HANDLE', value)
+            bot.reply_to(msg, f"✅ Channel handle updated to: @{value}")
+        elif h_type == "PAYMENT_ID":
+            db.db_set_setting('PAYMENT_CHANNEL_ID', value)
+            bot.reply_to(msg, f"✅ Payment Verification Channel ID updated to: {value}")
+        elif h_type == "SUPPORT_ID":
+            db.db_set_setting('SUPPORT_CHANNEL_ID', value)
+            bot.reply_to(msg, f"✅ Support Ticket Channel ID updated to: {value}")
+        else:
+            bot.reply_to(msg, "❌ Invalid Type! Use `SUPPORT`, `CHANNEL`, `PAYMENT_ID`, or `SUPPORT_ID`.")
+    except:
+        bot.reply_to(msg, "❌ Error! Format: `TYPE | HANDLE`")
+
+@bot.message_handler(commands=['clear_database'])
+def cmd_clear_db(msg):
+    """DANGER: Wipes all test data from the database"""
+    if not is_admin(msg.from_user.id): return
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔥 YES, WIPE EVERYTHING", callback_data="adm_wipe_confirm"))
+    markup.add(types.InlineKeyboardButton("❌ CANCEL", callback_data="app_home"))
+    bot.send_message(msg.chat.id, 
+        "⚠️ *DANGER ZONE*\n\nKya aap sach mein saara data delete karna chahte hain?\n\n"
+        "Isse niche di gayi tables khali ho jayengi:\n"
+        "• Matches & Players\n"
+        "• Teams & Points\n"
+        "• Payments & Ledger\n\n"
+        "Yeh action revert nahi ho sakta.", 
+        reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_wipe_confirm")
+def callback_wipe_confirm(call):
+    if not is_admin(call.from_user.id): return
+    try:
+        with db.get_db() as conn:
+            tables = ['MATCHES_LIST', 'PLAYERS', 'TEAMS', 'PAYMENTS', 'PAYMENT_INTENTS', 'USED_UTR', 'LEDGER', 'PLAYER_LIVE_STATS', 'MATCH_EVENTS']
+            for table in tables:
+                conn.execute(f"DELETE FROM {table}")
+        global MATCHES, PLAYERS_CACHE
+        MATCHES = {}
+        PLAYERS_CACHE = {}
+        bot.edit_message_text("✅ *Database Wiped Clean!* Saara test data delete ho gaya hai. Ab aap fresh start kar sakte hain.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error during wipe: {e}", call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(commands=['rules'])
+def cmd_rules(msg):
+    """Users ko scoring system samjhane ke liye"""
+    rules = f"""
+📊 *SCORING*
+🏏 Run: 1 | 4s: +4 | 6s: +6
+⚾ Wkt: +25 | Maiden: +10
+👑 Multiplier: C: 2x | VC: 1.5x
+🚫 Lock: Match start hone par.
+"""
+    bot.send_message(msg.chat.id, rules, parse_mode='Markdown')
+
+# ===================================================
+# FEATURE 5: Live Rank During Match
+# ===================================================
+@bot.message_handler(commands=['myrank'])
+def cmd_myrank(msg):
+    # Brand new function
+    uid = str(msg.from_user.id)
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for mid, info in MATCHES.items():
+        if is_match_locked(mid):
+            markup.add(types.InlineKeyboardButton(
+                f"📊 {info['name']}", 
+                callback_data=f"show_rank_{mid}"))
+    
+    if not markup.keyboard:
+        bot.send_message(msg.chat.id,
+            "⏳ *Abhi koi match live nahi hai!*\n\n"
+            "Match start hone ke baad /myrank karein.",
+            parse_mode='Markdown')
+        return
+    
+    bot.send_message(msg.chat.id,
+        "📊 *LIVE RANK*\nKaunse match ka rank dekhna hai?",
+        reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_rank_"))
+def callback_show_rank(call):
+    uid = str(call.from_user.id)
+    mid = call.data.split("_")[2]
+    
+    rank_data = db.db_get_user_rank(uid, mid)
+    total = db.db_get_match_participant_count(mid)
+    
+    # Get user's teams for this match
+    teams_text = ""
+    for i in range(1, 4): # Assuming max 3 teams for simplicity in display
+        t = db_get_team(uid, mid, i)
+        if t and t.get('is_paid'):
+            pts = t.get('points', 0)
+            teams_text += f"Team {i}: {pts} pts\n"
+    
+    if not rank_data:
+        text = (
+            "❌ *Is match mein join nahi kiya!*\n\n"
+            "Paid contest mein hote to rank dikhta."
+        )
+    else:
+        rank = rank_data['rank']
+        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
+        text = (
+            f"📊 *LIVE RANK — {MATCHES[mid]['name']}*\n\n"
+            f"Aapka Rank: *{medal} / {total}*\n\n"
+            f"{teams_text}\n"
+            f"🔄 Points update hote rehte hain\n"
+            f"_/myrank dobara karein latest rank ke liye_"
+        )
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"show_rank_{mid}"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         reply_markup=markup, parse_mode='Markdown')
+
+# ===================================================
+# CALLBACKS
+# ===================================================
+
+@bot.callback_query_handler(func=lambda call: call.data == "rules")
+def callback_handler(call):
+    cmd_rules(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "app_home")
+def callback_app_home(call):
+    bot.answer_callback_query(call.id)
+    start_command(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "app_wallet")
+def callback_app_wallet(call):
+    bot.answer_callback_query(call.id)
+    cmd_wallet(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "app_myrank")
+def callback_app_myrank(call):
+    bot.answer_callback_query(call.id)
+    cmd_myrank(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_player_stats_"))
+def callback_show_player_stats(call):
+    uid = str(call.from_user.id)
+    match_id = call.data.split("_")[3]
+    
+    bot.answer_callback_query(call.id)
+    
+    match_name = MATCHES.get(match_id, {}).get('name', match_id)
+    # This is fine as it's for viewing stats, not high-speed selection
+    with db.get_db() as c:
+        c.execute("SELECT player_name, runs, fours, sixes, wickets FROM PLAYER_LIVE_STATS WHERE match_id=%s", (match_id,))
+        player_stats = c.fetchall()
+    
+    # Pass the POINT_SYSTEM from scoring module to UI for calculation
+    markup, text = ui.player_stats_render(match_id, match_name, player_stats, scoring.POINT_SYSTEM)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+def send_onboarding_step1(chat_id, first_name):
+    """Step 1: Welcome + How it works"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ Next: Team Kaise Banate Hain", callback_data="onboard_step2"))
+    
+    bot.send_message(chat_id,
+        f"🏏 *Welcome {first_name}! Chaliye shuru karte hain!*\n\n"
+        f"*Yeh bot kya karta hai?*\n\n"
+        f"1️⃣ Aap cricket players choose karte ho\n"
+        f"2️⃣ Contest mein entry lete ho\n"
+        f"3️⃣ Real match ke hisaab se points milte hain\n"
+        f"4️⃣ Top rank pe prize milta hai! 💰\n\n"
+        f"*Step 1/3 — Basics samajh liye!*",
+        reply_markup=markup, parse_mode='Markdown')
+
+def send_onboarding_step2(chat_id):
+    """Step 2: Team building guide"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ Next: Scoring & Prizes", callback_data="onboard_step3"))
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="onboard_step1_back"))
+    
+    bot.send_message(chat_id,
+        f"🧑‍💼 *Team Kaise Banate Hain?*\n\n"
+        f"✅ 11 players chunte hain:\n"
+        f"• 3-6 Batsmen 🏏\n"
+        f"• 1-4 Wicketkeepers 🧤\n"
+        f"• 1-4 All-rounders ⭐\n"
+        f"• 3-6 Bowlers 🎯\n\n"
+        f"👑 *Captain = 2x Points*\n"
+        f"⭐ *Vice Captain = 1.5x Points*\n\n"
+        f"_Sahi C/VC choose karna sabse zaroori hai!_\n\n"
+        f"*Step 2/3*",
+        reply_markup=markup, parse_mode='Markdown')
+
+def send_onboarding_step3(chat_id):
+    """Step 3: Prizes + CTA"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🏏 APNI PEHLI TEAM BANAO!", callback_data="cmd_my_team_nav"))
+    markup.add(types.InlineKeyboardButton("🏆 CONTESTS DEKHO", callback_data="contest_list"))
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="onboard_step2_back"))
+    
+    bot.send_message(chat_id,
+        f"🏆 *Prizes Kaise Milte Hain?*\n\n"
+        f"🥇 Rank #1 → ₹2000\n"
+        f"🥈 Rank #2 → ₹800\n"
+        f"🥉 Rank #3 → ₹400\n\n"
+        f"💰 *Min Withdrawal: ₹{MIN_WITHDRAWAL}*\n"
+        f"⚡ *UPI pe instant payout*\n\n"
+        f"🎁 *Refer & Earn:* Dost ko refer karo\n"
+        f"   → Unke pehle contest pe ₹10 bonus!\n\n"
+        f"*Step 3/3 — Ab shuru karo!* 🚀",
+        reply_markup=markup, parse_mode='Markdown')
+
+# Onboarding callbacks
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step2")
+def callback_onboard_step2(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step2(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step3")
+def callback_onboard_step3(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step3(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step1_back")
+def callback_onboard_back1(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step1(call.message.chat.id, call.from_user.first_name)
+
+@bot.callback_query_handler(func=lambda call: call.data == "onboard_step2_back")
+def callback_onboard_back2(call):
+    bot.answer_callback_query(call.id)
+    send_onboarding_step2(call.message.chat.id)
+
+def handle_selection(call):
+    # FIX 4: Rate Limiting
+    uid = str(call.from_user.id)
+    now = time.time()
+    if now - _selection_cooldown.get(uid, 0) < 0.5:
+        bot.answer_callback_query(call.id, "⚡ Thoda ruko...")
+        return
+    _selection_cooldown[uid] = now
+
+    parts = call.data.split("_")
+    match_id, team_num, role = parts[1], int(parts[2]), parts[3]
+    player_name = " ".join(parts[4:])
+    cache_key = (uid, match_id, team_num)
+
+    if is_match_locked(match_id):
+        bot.answer_callback_query(call.id, "🚫 Match lock ho chuka hai!", show_alert=True)
+        return
+
+    # ⚡ CACHE UPDATE ONLY - NO DATABASE WRITE
+    team = db_get_team(uid, match_id, team_num) # Hydrates cache if empty
+    if not team: team = {k: [] for k in ROLES}
+    
+    selected = team.get(role, [])
+    _, role_max = ROLE_LIMITS[role]
+    total = get_total_players(team)
+
+    if player_name in selected:
+        selected.remove(player_name)
+        bot.answer_callback_query(call.id, f"❌ {player_name} removed!")
+    else:
+        if role != 'sub' and total >= 11:
+            bot.answer_callback_query(call.id, "⚠️ Squad full! (Max 11 Players)", show_alert=True)
+            return
+
+        if len(selected) >= role_max:
+            bot.answer_callback_query(call.id, f"⚠️ {ROLE_NAMES[role]} ki limit {role_max} hai!", show_alert=True)
+            return
+        selected.append(player_name)
+        bot.answer_callback_query(call.id, f"✅ {player_name} added!")
+
+    # FIX 3: Persistence for selection
+    temp_team_cache[cache_key] = team
+    # Refresh UI instantly
+    show_player_selection(call.message.chat.id, uid, role, match_id, team_num, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_catchall(call):
+    # Route Admin commands
+    if call.data.startswith("adm_"):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id, "🚫 Unauthorized!", show_alert=True)
+            return
+        import admin_app # Lazy import to avoid circular dependency
+        admin_app.handle_admin_nav(call, bot)
+        return
+        
+    # Route Match Management Callbacks
+    if call.data.startswith("adm_m_"):
+        if not is_admin(call.from_user.id): return
+        parts = call.data.split("_")
+        action, mid = parts[2], parts[3]
+        
+        if action == "add":
+            sent = bot.send_message(call.message.chat.id, 
+                f"👤 *ADD PLAYERS TO {mid}*\n\nFormat: `player_name | role`\nMultiple lines use karein.\n\nRoles: `bat, wk, ar, bowl, sub`", 
+                parse_mode='Markdown', reply_markup=types.ForceReply())
+            bot.register_next_step_handler(sent, process_player_addition)
+            
+        elif action == "view":
+            # Re-using the list_players logic
+            call.message.text = f"/list_players {mid}"
+            cmd_list_players(call.message)
+            
+        elif action == "del":
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("✅ CONFIRM DELETE", callback_data=f"adm_m_realdel_{mid}"),
+                types.InlineKeyboardButton("❌ CANCEL", callback_data="app_home")
+            )
+            bot.edit_message_text(f"⚠️ *ARE YOU SURE?*\n\nMatch `{mid}` delete karne se sabhi teams aur data chala jayega!", 
+                                 call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+                                 
+        elif action == "realdel":
+            try:
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM MATCHES_LIST WHERE match_id=%s", (mid,))
+                    conn.execute("DELETE FROM PLAYERS WHERE match_id=%s", (mid,))
+                    conn.execute("DELETE FROM TEAMS WHERE match_id=%s", (mid,))
+                MATCHES.pop(mid, None)
+                PLAYERS_CACHE.pop(mid, None)
+                bot.edit_message_text(f"✅ Match `{mid}` and all related data deleted successfully.", 
+                                     call.message.chat.id, call.message.message_id)
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"Error: {e}", show_alert=True)
+        
+        bot.answer_callback_query(call.id)
+        return
+
+    # PATCH: /help command support button handler
+    if call.data == "start_support":
+        cmd_support(call.message)
+        return
+    # Route Scoring events
+    if call.data.startswith("evt_"):
+        parts = call.data.split("_")
+        scoring.update_match_event(parts[1], parts[2], parts[3])
+        bot.answer_callback_query(call.id, "✅ Point Updated!")
+        return
+
+    logging.info(f"Unmatched callback: {call.data}")
+
+# COMMANDS
+# ===================================================
+
+@bot.message_handler(commands=['setcaptain', 'setvc'])
+def cmd_set_cv(msg):
+    uid = str(msg.from_user.id)
+    parts = msg.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        bot.reply_to(msg, "Usage: /setcaptain Virat Kohli")
+        return
+    
+    name = parts[1].strip()
+    team = db_get_team(uid)
+    
+    if not team:
+        bot.reply_to(msg, "❌ Build team first!")
+        return
+    
+    all_players = []
+    for role in ROLES:
+        all_players.extend(team.get(role, []))
+    
+    if name not in all_players:
+        bot.reply_to(msg, f"'{name}' not in team!")
+        return
+    
+    key = 'captain' if 'setcaptain' in msg.text else 'vice_captain'
+    team[key] = name
+    db_save_team(uid, team)
+
+    emoji = "👑" if key == 'captain' else "⭐"
+    bot.reply_to(msg, f"{emoji} {name} set!")
+
+@bot.message_handler(commands=['admin_panel'])
+def cmd_admin(msg):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, f"🚫 **Access Denied!**\nAapka User ID (`{msg.from_user.id}`) admin list mein nahi hai.\n\nCheck `.env` file and set `ADMIN_ID={msg.from_user.id}`", parse_mode='Markdown')
+        return
+    try:
+        stats = db.get_admin_stats()
+        markup, text = ui.admin_dashboard_home(stats, MATCHES)
+        bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Admin panel error: {e}")
+        bot.reply_to(msg, f"❌ **Dashboard Error:**\n`{str(e)}`", parse_mode='Markdown')
+
+@bot.message_handler(commands=['admin_help'])
+def cmd_admin_help(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        markup, text = ui.admin_help_render()
+        bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Admin help error: {e}")
+
+@bot.message_handler(commands=['download_db'])
+def cmd_download_db(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, 'rb') as f:
+                bot.send_document(msg.chat.id, f, caption=f"📂 Database Backup: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            bot.reply_to(msg, "❌ Database file not found!")
+    except Exception as e:
+        logging.error(f"Error downloading DB: {e}")
+    bot.reply_to(msg, "📂 PostgreSQL use ho raha hai, isliye `/export_data` use karein CSV backup ke liye.")
+
+@bot.message_handler(commands=['export_data'])
+def cmd_export_data(msg):
+    """Saari main tables ko CSV bana kar admin ko bhejta hai"""
+    if not is_admin(msg.from_user.id): return
+    
+    # List ko expand kiya hai taaki poora hisaab mil sake
+    tables = ['USERS', 'PAYMENTS', 'WITHDRAWALS', 'MATCHES_LIST', 'TEAMS', 'LEDGER', 'CONTEST_CONFIG']
+    bot.send_message(msg.chat.id, "📤 *Generating CSV Backups...*")
+
+    for table in tables:
+        try:
+            with db.get_db() as conn:
+                conn.execute(f"SELECT * FROM {table}")
+                rows = conn.fetchall()
+                if not rows:
+                    bot.send_message(msg.chat.id, f"ℹ️ Table *{table}* abhi khali hai (No Data).", parse_mode='Markdown')
+                    continue
+                
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+                
+                output.seek(0)
+                # Convert to binary stream for Telegram
+                bio = io.BytesIO(output.getvalue().encode('utf-8'))
+                bio.name = f"{table.lower()}_backup_{datetime.now().strftime('%Y%m%d')}.csv"
+                bot.send_document(msg.chat.id, bio, caption=f"📊 Table: {table}")
+                time.sleep(1) # Telegram anti-flood delay
+        except Exception as e:
+            bot.send_message(msg.chat.id, f"❌ Error exporting {table}: {e}")
+    
+    bot.send_message(msg.chat.id, "✅ Backup complete!")
+
+@bot.message_handler(commands=['broadcast'])
+def cmd_broadcast(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    
+    markup = types.ForceReply(selective=True)
+    bot.send_message(msg.chat.id, "📝 *Enter the message you want to broadcast to all users:*\n\n(Markdown formatting is supported)", 
+                     reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_broadcast_message)
+
+def process_broadcast_message(msg):
+    if not is_admin(msg.from_user.id):
+        return
+
+    # 📸 Support for Photo Broadcasts
+    is_photo = msg.content_type == 'photo'
+    file_id = msg.photo[-1].file_id if is_photo else None
+    caption_or_text = msg.caption if is_photo else msg.text
+
+    broadcast_text = sanitize_input(caption_or_text, 4000)
+    if not broadcast_text and not is_photo:
+        bot.send_message(ADMIN_ID, "❌ Broadcast message cannot be empty.")
+        return
+
+    bot.send_message(ADMIN_ID, "🚀 Starting broadcast... This may take a while.")
+    
+    my_id = str(bot.get_me().id)
+    success_count = 0
+    fail_count = 0
+    with db.get_db() as conn:
+        conn.execute("SELECT user_id FROM USERS")
+        users = conn.fetchall()
+        for user_row in users:
+            # Skip the bot itself if its ID is in the database
+            if str(user_row['user_id']) == my_id:
+                continue
+            try:
+                if is_photo:
+                    bot.send_photo(user_row['user_id'], file_id, caption=broadcast_text, parse_mode='Markdown')
+                else:
+                    bot.send_message(user_row['user_id'], broadcast_text, parse_mode='Markdown')
+                success_count += 1
+                time.sleep(0.05) # Small delay to avoid hitting Telegram API limits
+            except telebot.apihelper.ApiTelegramException as e:
+                logging.warning(f"Failed to send broadcast to user {user_row['user_id']}: {e}")
+                fail_count += 1
+    
+    bot.send_message(ADMIN_ID, f"✅ Broadcast finished!\n\nSent to {success_count} users.\nFailed for {fail_count} users (likely blocked the bot).")
+
+def send_prematch_reminders():
+    """Checks for upcoming matches and notifies users who haven't joined yet"""
+    now = get_now()
+    for mid, info in MATCHES.items():
+        deadline = info['deadline']
+        time_to_match = deadline - now
+        
+        # Match starts in 30-45 minutes
+        if timedelta(minutes=30) <= time_to_match <= timedelta(minutes=45):
+            # 1. Users with NO team saved
+            users_no_team = db.db_get_users_without_team(mid)
+            for uid in users_no_team:
+                if not db.db_was_reminder_sent(mid, uid, 'prematch'):
+                    try:
+                        bot.send_message(uid, f"🏏 *Match Starting Soon!* ⏳\n\n`{info['name']}` ka deadline 30 min mein hai. Jaldi apni team banayein aur join karein!", parse_mode='Markdown')
+                        db.db_mark_reminder_sent(mid, uid, 'prematch')
+                    except: pass
+            
+            # 2. Users with saved but UNPAID teams
+            users_unpaid = db.db_get_users_unpaid_team(mid)
+            for uid in users_unpaid:
+                if not db.db_was_reminder_sent(mid, uid, 'unpaid_team'):
+                    try:
+                        bot.send_message(uid, f"⚠️ *Team Not Joined!*\n\nAapne `{info['name']}` ke liye team banayi hai par contest join nahi kiya. Deadline se pehle join karein!", parse_mode='Markdown')
+                        db.db_mark_reminder_sent(mid, uid, 'unpaid_team')
+                    except: pass
+
+# ===================================================
+# FEATURE 3: Re-engagement Notification (3 Day Inactive)
+# ===================================================
+def send_reengagement_notifications():
+    """Sends re-engagement messages to inactive users."""
+    inactive_users = db.db_get_inactive_users(days=3)
+    for user in inactive_users:
+        uid = user['user_id']
+        first_name = user['first_name']
+        try:
+            text = (
+                f"👋 *Hey {first_name}, wapas aao!* 👋\n\n"
+                "Aapko miss kar rahe hain! Naye matches aur bade prizes aapka intezaar kar rahe hain.\n\n"
+                "Jaldi se bot par wapas aao aur apni team banao! 🏏"
+            )
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🏆 CONTESTS DEKHO", callback_data="contest_list"))
+            bot.send_message(uid, text, reply_markup=markup, parse_mode='Markdown')
+            db.db_mark_reminder_sent(None, uid, 'reengagement') # match_id is None for re-engagement
+            time.sleep(0.05)
+        except Exception as e:
+            logging.warning(f"Failed to send re-engagement to {uid}: {e}")
+
+# ===================================================
+# POINTS CALCULATION SYSTEM
+# ===================================================
+
+# This function is primarily for manual /up command or final calculation
+def calculate_all_points(match_id, player_scores):
+    """
+    match_id: Specific match target
+    player_scores: Dictionary of {'Player Name': score}
+    """
+    try:
+        with db.get_db() as conn:
+            conn.execute("SELECT * FROM TEAMS WHERE match_id = %s", (match_id,))
+            teams_rows = conn.fetchall()
+            results = []
+            
+            configs = {cfg['entry_fee']: cfg for cfg in db.db_get_all_contest_configs(match_id)}
+
+            for row in teams_rows:
+                uid = row['user_id']
+                team_data = json.loads(row['team_players'])
+                captain = row['captain']
+                vice_captain = row['vice_captain']
+                
+                total_pts = 0
+                # Har category ke players ke points jodo
+                # Include 'sub' in point calculation
+                for role in ['bat', 'wk', 'ar', 'bowl', 'sub']:
+                    for p in team_data.get(role, []):
+                        p_pts = player_scores.get(p, 0) # This comes from manual input
+                        if p == captain:
+                            total_pts += p_pts * scoring.CAPTAIN_MULTIPLIER  # Captain 2x
+                        elif p == vice_captain:
+                            total_pts += p_pts * scoring.VC_MULTIPLIER # VC 1.5x
+                        else:
+                            total_pts += p_pts
+                
+                # DB mein update karein
+                conn.execute("UPDATE TEAMS SET points = %s WHERE user_id = %s AND match_id = %s AND team_num = %s", (total_pts, uid, row['match_id'], row['team_num']))
+                results.append({'user_id': uid, 'points': total_pts})
+            
+            # ADD 5: Prize Auto-Credit
+            results.sort(key=lambda x: x['points'], reverse=True)
+            
+            for index, res in enumerate(results):
+                rank = index + 1
+                
+                # Logic to determine prize from db config (simplified here)
+                prize_amt = 0
+                prize_text = "₹0"
+                if rank == 1: prize_amt = 2000
+                elif rank == 2: prize_amt = 800
+                elif rank == 3: prize_amt = 400
+                
+                if prize_amt > 0:
+                    prize_text = f"₹{prize_amt}"
+                    ref_id = f"PRIZE_{match_id}_{rank}_{res['user_id']}"
+                    process_payment_success(res['user_id'], prize_amt, ref_id, conn=conn)
+                    bot.send_message(res['user_id'], f"🎊 *Winner!*\nAapne Match `{match_id}` mein #{rank} rank hasil kiya! ₹{prize_amt} credit ho gaye hain.")
+                else:
+                    bot.send_message(res['user_id'], f"📉 Match `{match_id}` ended. Aapka rank #{rank} raha. Better luck next time!")
+                
+                # Results Sheet mein sync karein
+                sheets.sync_wrapper({
+                    "contest_date": datetime.now().strftime('%Y-%m-%d'),
+                    "user_id": res['user_id'],
+                    "points": res['points'],
+                    "rank": rank,
+                    "prize": prize_text
+                }, "RESULTS")
+                
+                # Notify User (Optional: only for top ranks to avoid spam)
+                if rank <= 3:
+                    bot.send_message(res['user_id'], f"🎊 *CONGRATS!*\n\nAapka rank *#{rank}* hai with *{res['points']}* points!\nPrize: {prize_text}\n\n📸 *Note:* Payout hote hi payment ka screenshot yahi share kiya jayega.", parse_mode='Markdown')
+                
+        return True
+    except Exception as e:
+        logging.error(f"Points calculation error: {e}")
+        return False
+
+@bot.message_handler(commands=['add_match'])
+def cmd_add_match(msg):
+    if not is_admin(msg.from_user.id): return
+    text = (
+        "🆕 *ADD NEW MATCH*\n\n"
+        "Niche diye gaye format mein details bhejein:\n"
+        "`match_id | Name | Type | YYYY-MM-DD HH:MM`\n\n"
+        "Example:\n"
+        "`m1 | CSK vs MI | IPL T20 | 2026-05-01 19:30`"
+    )
+    sent = bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_match_input)
+
+def process_match_input(msg):
+    if not is_admin(msg.from_user.id): return
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        if len(parts) < 4:
+            bot.reply_to(msg, "❌ Format galat hai! Example: `m5 | RR vs PBKS | IPL T20 | 2026-04-24 19:30`")
+            return
+        
+        mid, name, m_type, deadline_str = parts[0], parts[1], parts[2], parts[3]
+        # Validate date
+        datetime.strptime(deadline_str, '%Y-%m-%d %H:%M')
+        
+        db.db_add_match(mid, name, m_type, deadline_str)
+        PLAYERS_CACHE.pop(mid, None) # Clear cache for this match
+        sync_matches_from_db() # Refresh memory cache
+        uid = str(msg.from_user.id)
+        ADMIN_MATCH_CONTEXT[uid] = mid # Remember match context
+        ADMIN_MATCH_CONTEXT[uid + "_wizard"] = True # Start setup wizard
+
+        bot.reply_to(msg, f"✅ *Match Added: {name}*\n\nAb is match ke liye *Players* bhein (Har line pe ek):\n`Name | role` (e.g. `Virat Kohli | bat`)", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_player_addition)
+    except Exception as e:
+        bot.reply_to(msg, f"❌ Error: {e}\nFormat check karein: `YYYY-MM-DD HH:MM`")
+
+@bot.message_handler(commands=['add_player'])
+def cmd_add_player(msg):
+    if not is_admin(msg.from_user.id): return
+    active_mid = ADMIN_MATCH_CONTEXT.get(str(msg.from_user.id), "m1")
+    help_text = (
+        "👤 *QUICK ADD PLAYER*\n\n"
+        "👉 *Format 1 (Bulk):*\n"
+        f"`{active_mid}` (Pehli line)\n"
+        "`Player Name | role` (Baaki lines)\n\n"
+        "👉 *Format 2 (Single):*\n"
+        f"`{active_mid} | Name | role`\n\n"
+        "Roles: `bat, wk, ar, bowl, sub`"
+    )
+    sent = bot.send_message(msg.chat.id, help_text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_player_addition)
+
+def process_player_addition(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    try:
+        lines = msg.text.strip().split('\n')
+        added_players = []
+        failed_players = []
+        
+        # Smart Detection: If first line is just a match_id
+        default_mid = ADMIN_MATCH_CONTEXT.get(uid)
+        if len(lines) > 1 and "|" not in lines[0]:
+            default_mid = lines[0].strip()
+            lines = lines[1:]
+            ADMIN_MATCH_CONTEXT[uid] = default_mid # Update context
+        
+        for line in lines:
+            parts = [p.strip() for p in line.split("|")]
+            
+            if len(parts) == 3: # Format: mid | name | role
+                mid, name, role = parts[0], parts[1], parts[2].lower()
+            elif len(parts) == 2 and default_mid: # Format: name | role
+                mid, name, role = default_mid, parts[0], parts[1].lower()
+            else:
+                failed_players.append(f"❌ Format error: `{line}`")
+                continue
+
+            if role not in ROLES:
+                failed_players.append(f"❌ Galat role `{role}`: `{name}`")
+                continue
+                
+            try:
+                db.db_add_player(mid, name, role)
+                PLAYERS_CACHE.pop(mid, None) # Invalidate cache
+                added_players.append(f"✅ {name} ({role.upper()})")
+            except Exception as e:
+                if "unique constraint" in str(e).lower():
+                    failed_players.append(f"⚠️ {name} (Pehle se hai)")
+                else:
+                    failed_players.append(f"❌ {name}: {str(e)}")
+        
+        response_text = f"📊 *IMPORT STATUS ({mid})*\n━━━━━━━━━━━━━━\n"
+        if added_players:
+            response_text += "\n".join(added_players)
+        if failed_players:
+            response_text += "\n\n*Nahi huye:*\n" + "\n".join(failed_players)
+            
+        bot.send_message(msg.chat.id, response_text, parse_mode='Markdown')
+
+        # Wizard Flow: Check if we should proceed to contest setup
+        if ADMIN_MATCH_CONTEXT.get(uid + "_wizard"):
+            bot.send_message(msg.chat.id, "✅ *Players Sync Ho Gaye!*\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots | comm%` (e.g. `100 | 50 | 10`)", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, process_mega_setup)
+
+    except Exception as e:
+        bot.reply_to(msg, f"❌ Error: {e}")
+
+def process_mega_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        comm = int(parts[2]) if len(parts) > 2 else None
+        
+        db.db_set_contest_config(mid, fee, slots)
+        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
+        
+        txt = (f"✅ *MEGA Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
+               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
+               f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots`) ya `skip` likhein:")
+        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_medium_setup)
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`)")
+        bot.register_next_step_handler(msg, process_mega_setup)
+
+def process_medium_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "⏭️ Medium skipped. Ab **🥉 SMALL Contest** bhein (`fee | slots`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        comm = int(parts[2]) if len(parts) > 2 else None
+
+        db.db_set_contest_config(mid, fee, slots)
+        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
+        
+        txt = (f"✅ *MEDIUM Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
+               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
+               f"Ab **🥉 SMALL Contest** details bhein (`fee | slots`) ya `skip` likhein:")
+        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_small_setup)
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`)")
+        bot.register_next_step_handler(msg, process_medium_setup)
+
+def process_small_setup(msg):
+    if not is_admin(msg.from_user.id): return
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    ADMIN_MATCH_CONTEXT.pop(uid + "_wizard", None) # Wizard complete
+
+    if msg.text.lower() == 'skip':
+        bot.send_message(msg.chat.id, "✅ *Match Setup Complete!* Sabhi updates live hain.")
+        return
+
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        fee, slots = int(parts[0]), int(parts[1])
+        db.db_set_contest_config(mid, fee, slots)
+        bot.send_message(msg.chat.id, "✅ *SMALL Contest Set!*\n\n🚀 *Match Setup Complete!* Match ab users ke liye dashboard par live hai.")
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`)")
+        bot.register_next_step_handler(msg, process_small_setup)
+
+@bot.message_handler(commands=['list_players'])
+def cmd_list_players(msg):
+    if not is_admin(msg.from_user.id): return
+    parts = msg.text.split()
+    if len(parts) < 2:
+        bot.reply_to(msg, "Usage: `/list_players m1`", parse_mode='Markdown')
+        return
+        
+    mid = parts[1]
+    ADMIN_MATCH_CONTEXT[str(msg.from_user.id)] = mid # Remember this match
+    players = get_players(mid)
+    
+    text = f"📋 *PLAYER LIST - {mid}*\n━━━━━━━━━━━━━━━━━━━━\n"
+    found = False
+    for role in ROLES:
+        p_list = players.get(role, [])
+        if p_list:
+            found = True
+            text += f"\n*{ROLE_NAMES[role].upper()}:*\n• " + "\n• ".join(p_list) + "\n"
+            
+    if not found:
+        text = f"❌ No players found for match ID: `{mid}`"
+        
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['my_matches'])
+def cmd_my_matches(msg):
+    """F10: Admin command to view and manage all matches in the system"""
+    if not is_admin(msg.from_user.id): return
+    
+    if not MATCHES:
+        bot.send_message(msg.chat.id, "❌ No matches found in system.")
+        return
+
+    bot.send_message(msg.chat.id, "📋 *ALL MATCHES*", parse_mode='Markdown')
+    now = get_now()
+    
+    for mid, info in MATCHES.items():
+        deadline = info['deadline']
+        player_count = db.db_get_player_count(mid)
+        
+        # Status Logic
+        if now > deadline:
+            status = "🔒 LOCKED"
+        else:
+            delta = deadline - now
+            total_sec = delta.total_seconds()
+            
+            # Format time left string
+            if delta.days > 0:
+                time_str = f"{delta.days}d {delta.seconds//3600}h"
+            else:
+                time_str = f"{delta.seconds//3600}h {(delta.seconds//60)%60}m"
+                
+            if total_sec < 6 * 3600:
+                status = f"🟢 OPEN ({time_str} left)"
+            else:
+                status = f"🟡 UPCOMING ({time_str} left)"
+
+        count_display = f"{player_count}" + (" ⚠️" if player_count == 0 else "")
+        deadline_display = deadline.strftime('%d %b %Y • %I:%M %p')
+
+        match_text = (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 ID: `{mid}`\n"
+            f"🏏 Match: *{info['name']}*\n"
+            f"📅 Type: {info['type']}\n"
+            f"⏰ Deadline: {deadline_display}\n"
+            f"⌛ Status: {status}\n"
+            f"👥 Players Added: {count_display}\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("➕ Add Players", callback_data=f"adm_m_add_{mid}"),
+            types.InlineKeyboardButton("👥 View Players", callback_data=f"adm_m_view_{mid}"),
+            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"adm_m_del_{mid}")
+        )
+        bot.send_message(msg.chat.id, match_text, reply_markup=markup, parse_mode='Markdown')
+
+    bot.send_message(msg.chat.id, f"Total: {len(MATCHES)} matches")
+
+@bot.message_handler(commands=['delete_player'])
+def cmd_delete_player(msg):
+    if not is_admin(msg.from_user.id): return
+    help_text = (
+        "🗑️ *DELETE PLAYER*\n\n"
+        "Format: `match_id | player_name`\n"
+        "Example: `m3 | Rohit Sharma`"
+    )
+    sent = bot.send_message(msg.chat.id, help_text, parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_player_deletion)
+
+def process_player_deletion(msg):
+    if not is_admin(msg.from_user.id): return
+    try:
+        parts = [p.strip() for p in msg.text.split("|")]
+        if len(parts) < 2:
+            bot.reply_to(msg, "❌ Format: `mid | Name`")
+            return
+        mid, name = parts[0], parts[1]
+        db.db_delete_player(mid, name)
+        PLAYERS_CACHE.pop(mid, None) # Invalidate cache
+        bot.reply_to(msg, f"🗑️ Player `{name}` removed from match `{mid}`.", parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(msg, f"❌ Error: {e}")
+
+@bot.message_handler(commands=['update_points', 'up'])
+def cmd_update_points(msg):
+    """
+    Fast Update:
+    1. /up Kohli 50 (Uses active match)
+    2. /up m1 Kohli 50
+    3. /up m1 | Kohli:50, Rohit:20 (Bulk)
+    """
+    if not is_admin(msg.from_user.id):
+        return
+
+    uid = str(msg.from_user.id)
+    text = msg.text.replace('/update_points', '').replace('/up', '').strip()
+    
+    if not text:
+        bot.reply_to(msg, "⚡ *Quick Update:* `/up PlayerName Score` (e.g. `/up Kohli 50`)", parse_mode='Markdown')
+        return
+
+    try:
+        if "|" in text: # Bulk format
+            mid_part, scores_part = text.split("|")
+            mid = mid_part.strip()
+            scores = {p.split(':')[0].strip(): float(p.split(':')[1].strip()) for p in scores_part.split(',')}
+        else: # Simple space-separated format
+            parts = text.split()
+            if parts[0] in MATCHES: # Format: /up m1 Kohli 50
+                mid = parts[0]
+                player = " ".join(parts[1:-1])
+                score = float(parts[-1])
+            else: # Format: /up Kohli 50 (Uses context)
+                mid = ADMIN_MATCH_CONTEXT.get(uid, "m1")
+                player = " ".join(parts[:-1])
+                score = float(parts[-1])
+            scores = {player: score}
+        
+        if calculate_all_points(mid, scores):
+            bot.reply_to(msg, f"✅ Points updated for Match `{mid}`!")
+        else:
+            bot.reply_to(msg, "❌ Error calculating points.")
+    except Exception as e:
+        bot.reply_to(msg, "⚠️ Usage: `/up m1 | Kohli:50, Rohit:20`")
+
+# ===================================================
+# START BOT
+# ===================================================
+
+
+def reminder_worker():
+    last_reengagement_date = None
+    while True:
+        try:
+            send_prematch_reminders()
+            # FEATURE 3: Re-engagement Notification (3 Day Inactive)
+            today = get_now().date()
+            if last_reengagement_date != today:
+                send_reengagement_notifications()
+                last_reengagement_date = today
+        except Exception as e:
+            logging.error(f"Worker error: {e}")
+        time.sleep(300)  # Har 5 minute
+
+reminder_thread = threading.Thread(target=reminder_worker, daemon=True)
+reminder_thread.start()
+
+if __name__ == "__main__":
+    if os.getenv('RENDER'):
+        logging.info("🚀 Starting in WEBHOOK mode (Production)...")
+        server.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    else:
+        logging.info("🤖 Starting in POLLING mode (Local)...")
+        logging.info("🧹 Clearing webhook for local polling...")
+        bot.remove_webhook()
+        time.sleep(1)
+        while True:
+            try:
+                bot.infinity_polling(
+                    skip_pending=True,
+                    timeout=30,
+                    long_polling_timeout=30,
+                    interval=0
+                )
+            except Exception as e:
+                logging.error(f"Polling Error: {e}")
+                time.sleep(3)
