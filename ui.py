@@ -225,9 +225,9 @@ def payment_instructions_render(order_id, amount, upi_id):
 💰 Amount: *₹{amount}*
 🆔 Order ID: `{order_id}`
 ━━━━━━━━━━━━━━
-1️⃣ UPI par payment karein.
-2️⃣ **12-digit UTR** yahan bhein ⚡
-3️⃣ Ya screenshot bhein ⏳
+1️⃣ Upar di gayi UPI ID par payment karein.
+2️⃣ **Payment ho jane ke baad**, uska Screenshot ya 12-digit UTR number yahan niche bhejein. ⚡
+3️⃣ Verification hote hi aapka balance update ho jayega.
 ━━━━━━━━━━━━━━
 ⚠️ Expiry: 60 mins
 """
