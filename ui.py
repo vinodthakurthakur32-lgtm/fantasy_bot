@@ -135,7 +135,8 @@ def admin_help_render():
 🏏 <b>MATCH SETUP FLOW (Step-by-Step)</b>
 1️⃣ <code>/add_match</code> - Naya match details banayein
 2️⃣ <code>/add_player</code> - Players add karein (RR vs DC)
-   <i>Tip: Horizontal bhein (Name|w, Name|bat)</i>
+   <i>Format: Name | Role | Desig | Team</i>
+   <i>Ex: Virat Kohli | bat | c | RCB</i>
 3️⃣ <code>/setup_contests</code> - Ek sath Mega/Med/Small set karein
 
 🏆 <b>CONTESTS &amp; PLAYER MANAGEMENT</b>
