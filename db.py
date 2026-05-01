@@ -401,11 +401,11 @@ def get_admin_stats():
         today = now.strftime('%Y-%m-%d')
         five_mins_ago = (now - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
         
-        c.execute("SELECT COUNT(*) FROM USERS"); total = c.fetchone()['count']
-        c.execute("SELECT COUNT(*) FROM USERS WHERE last_seen > %s", (five_mins_ago,)); active = c.fetchone()['count']
-        c.execute("SELECT COUNT(*) FROM USERS WHERE joined_date LIKE %s", (f"{today}%",)); new_today = c.fetchone()['count']
-        c.execute("SELECT COUNT(DISTINCT user_id) FROM TEAMS WHERE is_paid=1"); paid = c.fetchone()['count']
-        c.execute("SELECT COUNT(*) FROM USERS WHERE is_flagged=1"); flagged = c.fetchone()['count']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS"); total = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE last_seen > %s", (five_mins_ago,)); active = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE joined_date LIKE %s", (f"{today}%",)); new_today = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM TEAMS WHERE is_paid=1"); paid = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE is_flagged=1"); flagged = c.fetchone()['cnt']
         
         conv_rate = (paid / total * 100) if total > 0 else 0
         
@@ -668,8 +668,10 @@ def db_get_user_rank(user_id, match_id):
 
 def db_get_match_participant_count(match_id):
     with get_db() as c:
-        c.execute("SELECT COUNT(DISTINCT user_id) FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
-        return c.fetchone()['count']
+        c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
+        row = c.fetchone()
+        if not row: return 0
+        return row.get('cnt', 0) if isinstance(row, dict) else row[0]
 
 def db_get_all_player_scores(match_id):
     """Returns a dictionary of all players and their current total points"""
