@@ -1,5 +1,5 @@
 import json
-from db import get_db
+import db
 
 POINT_SYSTEM = {
     'run': 1,
@@ -14,7 +14,7 @@ VC_MULTIPLIER = 1.5
 def update_match_event(match_id, player_name, event_type):
     points = POINT_SYSTEM.get(event_type, 0)
     
-    with get_db() as conn:
+    with db.get_db() as conn:
         # 1. Update Player Stats
         col = "runs" if event_type == 'run' else event_type + "s" if event_type in ['four', 'six'] else "wickets"
         conn.execute(f"""
