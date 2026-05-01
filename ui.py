@@ -363,7 +363,9 @@ def match_dashboard_render(match_id, info, stats, user_summary, time_left, conte
     avail_spots = stats['max_slots'] - stats['joined']
     
     live_link = info.get('live_link')
-    live_text = f"📺 Yaha match live dekh skte ho\n" if live_link else ""
+    if live_link:
+        markup.add(types.InlineKeyboardButton("📺 WATCH MATCH LIVE", url=live_link))
+    live_text = "📺 Match is LIVE! Niche button se dekhein.\n" if live_link else ""
 
     if contest_configs:
         for cfg in contest_configs:
