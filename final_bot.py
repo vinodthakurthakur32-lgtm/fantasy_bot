@@ -657,19 +657,48 @@ def callback_team_save(call):
             bot.answer_callback_query(call.id, f"❌ {ROLE_NAMES[role]} must be between {r_min}-{r_max}!")
             return
 
+    players_info = get_players(match_id)
     preview_text = f"📝 *TEAM PREVIEW (T{team_num})*\n"
     for role_key in ROLES:
         players = team.get(role_key, [])
         if players:
             preview_text += f"\n*{ROLE_NAMES[role_key]}:* {', '.join(players)}"
     
-    preview_text += f"\n\n👑 *C:* {team.get('captain', 'Not Selected')}\n⭐ *VC:* {team.get('vice_captain', 'Not Selected')}"
+    preview_text += f"\n\n👑 *C:* {team.get('captain', '❌ Not Selected')}\n⭐ *VC:* {team.get('vice_captain', '❌ Not Selected')}"
+    preview_text += "\n\n🎯 *CHOOSE CAPTAIN & VICE-CAPTAIN:*"
     
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("✅ CONFIRM & PROCEED TO C/VC", callback_data=f"final_confirm_save_{match_id}_{team_num}"),
-        types.InlineKeyboardButton("✏️ EDIT TEAM", callback_data=f"nav_bat_{match_id}_{team_num}")
-    )
+    markup = types.InlineKeyboardMarkup()
+    
+    # Playing 11 players (excluding subs) candidates honge
+    user_selected_names = []
+    for r in ['bat', 'wk', 'ar', 'bowl']:
+        user_selected_names.extend(team.get(r, []))
+
+    # Display names map nikalne ke liye logic
+    display_map = {}
+    for r in ROLES:
+        for p in players_info.get(r, []):
+            display_map[p['name']] = p['display']
+
+    for p_name in user_selected_names:
+        d_name = display_map.get(p_name, p_name)
+        c_icon = "👑" if team.get('captain') == p_name else "⚪"
+        vc_icon = "⭐" if team.get('vice_captain') == p_name else "⚪"
+
+        markup.row(types.InlineKeyboardButton(f"👤 {d_name}", callback_data="ignore"))
+        markup.row(
+            types.InlineKeyboardButton(f"{c_icon} CAPTAIN", callback_data=f"cv_{match_id}_{team_num}_c_{p_name.replace(' ', '_')}"),
+            types.InlineKeyboardButton(f"{vc_icon} VICE-CAPTAIN", callback_data=f"cv_{match_id}_{team_num}_vc_{p_name.replace(' ', '_')}")
+        )
+
+    if team.get('captain') and team.get('vice_captain'):
+        markup.add(types.InlineKeyboardButton("✅ SAVE TEAM & JOIN CONTEST 🚀", callback_data=f"final_confirm_save_{match_id}_{team_num}"))
+    else:
+        markup.add(types.InlineKeyboardButton("💾 SAVE SQUAD (Set C/VC Later)", callback_data=f"final_confirm_save_{match_id}_{team_num}"))
+
+    markup.add(types.InlineKeyboardButton("✏️ EDIT SQUAD", callback_data=f"nav_bat_{match_id}_{team_num}"))
+    markup.add(types.InlineKeyboardButton("🔙 BACK TO SLOTS", callback_data=f"team_slots_{match_id}"))
+    
     bot.edit_message_text(preview_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("final_confirm_save_"))
