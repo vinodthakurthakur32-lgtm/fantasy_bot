@@ -1,6 +1,5 @@
 from telebot import types
 import db, ui
-import final_bot # To access get_players and MATCHES
 from telebot.apihelper import ApiTelegramException
 
 def admin_main_markup(matches):
@@ -35,6 +34,7 @@ def admin_event_markup(match_id, players, active_role='bat'):
     return markup
 
 def handle_admin_nav(call, bot):
+    import final_bot # Local import to prevent circular dependency errors
     nav = call.data
     chat_id = call.message.chat.id
     mid = call.message.message_id
@@ -42,8 +42,18 @@ def handle_admin_nav(call, bot):
     if nav == "adm_nav_home":
         bot.answer_callback_query(call.id)
         stats = db.get_admin_stats()
-        markup, text = ui.admin_dashboard_home(stats)
+        markup, text = ui.admin_dashboard_home(stats, final_bot.MATCHES)
         bot.edit_message_text(text, chat_id, mid, reply_markup=markup, parse_mode='Markdown')
+
+    elif nav == "adm_nav_lead":
+        bot.answer_callback_query(call.id)
+        rows = final_bot.get_leaderboard(10)
+        markup, text = ui.admin_referral_render(rows) # Re-using referral style for leaderboard
+        bot.edit_message_text(text, chat_id, mid, reply_markup=markup, parse_mode='Markdown')
+        
+    elif nav == "adm_export_data":
+        bot.answer_callback_query(call.id, "Generating Backup...")
+        final_bot.cmd_export_data(call.message)
         
     elif nav == "adm_nav_funnel":
         bot.answer_callback_query(call.id)
