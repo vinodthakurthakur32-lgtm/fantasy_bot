@@ -153,7 +153,8 @@ def sync_matches_from_db():
                 'name': m['name'],
                 'type': m['type'],
                 'deadline': datetime.strptime(m['deadline'], '%Y-%m-%d %H:%M').replace(tzinfo=None),
-                'points_calculated': bool(m['points_calculated']) # New field
+                'points_calculated': bool(m['points_calculated']),
+                'manual_lock': m.get('manual_lock', 0) # 0: Auto, 1: Forced Lock, -1: Forced Unlock
             }
         except Exception as e:
             logging.error(f"Error parsing match {m['match_id']}: {e}")
@@ -229,15 +230,23 @@ def process_payment_success(user_id, amount, ref_id, match_context=None, conn=No
         except Exception as e: return False, str(e)
 
 def is_match_locked(match_id='m1'):
-    """Checks if the match deadline has passed"""
-    deadline = MATCHES.get(match_id, {}).get('deadline', datetime.now())
+    """Checks if the match is locked (Manual override takes priority)"""
+    info = MATCHES.get(match_id)
+    if not info: return False # Unknown match is not locked by default
+    
+    m_lock = info.get('manual_lock', 0)
+    if m_lock == 1: return True   # Admin forced LOCK
+    if m_lock == -1: return False # Admin forced UNLOCK
+    
+    # Default: Check Deadline
+    deadline = info.get('deadline', get_now())
     return get_now() > deadline
 
 def get_time_left(match_id='m1'):
     """Returns countdown string until lock"""
     match_info = MATCHES.get(match_id)
     if not match_info: return "N/A"
-    deadline = match_info.get('deadline', datetime.now())
+    deadline = match_info.get('deadline', get_now())
     delta = deadline - get_now()
     if delta.total_seconds() <= 0: return "LOCKED 🔒"
     return f"{delta.days}d {delta.seconds//3600}h {(delta.seconds//60)%60}m"
@@ -2217,6 +2226,21 @@ def callback_catchall(call):
         bot.answer_callback_query(call.id)
         return
 
+    if call.data.startswith("adm_toggle_lock_"):
+        parts = call.data.split("_")
+        mid, action = parts[3], parts[4]
+        new_val = 1 if action == 'lock' else -1
+        
+        db.db_set_manual_lock(mid, new_val)
+        sync_matches_from_db() # Reload cache
+        
+        bot.answer_callback_query(call.id, f"Match {'Locked' if new_val==1 else 'Unlocked'}!")
+        # Refresh the UI
+        players_data = get_players(mid)
+        markup = admin_app.admin_event_markup(mid, players_data, is_locked=is_match_locked(mid))
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
     # Route Admin commands
     if call.data.startswith("adm_"):
         if not is_admin(call.from_user.id):
@@ -3041,3 +3065,4 @@ if __name__ == "__main__":
             except Exception as e:
                 logging.error(f"Polling Error: {e}")
                 time.sleep(3)
+
