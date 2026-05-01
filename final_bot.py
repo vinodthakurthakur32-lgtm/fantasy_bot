@@ -171,17 +171,25 @@ def get_players(match_id):
         
     db_players = db.db_get_players_by_match(match_id)
     # 🛠️ Structure change: Storing dict with name and display info
-    formatted_data = {r: [] for r in ROLES} 
+    formatted_data = {r: [] for r in ROLES + ['cv']} 
     
     for p in db_players:
         role = p.get('role', '').lower()
+        desig = p.get('designation', '').lower()
+        
+        tag = " Ⓒ" if desig == 'c' else " Ⓥ" if desig == 'vc' else ""
+        display_name = f"{p['player_name']} ({p['team']}){tag}"
+        
+        p_obj = {
+            'name': p['player_name'],
+            'display': display_name
+        }
+        
         if role in formatted_data:
-            tag = " Ⓒ" if p.get('designation', '').lower() == 'c' else " Ⓥ" if p.get('designation', '').lower() == 'vc' else ""
-            display_name = f"{p['player_name']} ({p['team']}){tag}"
-            formatted_data[role].append({
-                'name': p['player_name'],
-                'display': display_name
-            })
+            formatted_data[role].append(p_obj)
+            
+        if desig in ['c', 'vc']:
+            formatted_data['cv'].append(p_obj)
     
     PLAYERS_CACHE[match_id] = formatted_data
     return formatted_data
@@ -784,17 +792,33 @@ def callback_cv_menu(call):
         for p_obj in players_info.get(role, []):
             display_map[p_obj['name']] = p_obj['display']
 
-    all_players = []
-    for role in ['bat', 'wk', 'ar', 'bowl']:
-        all_players.extend(team.get(role, []))
+    # Filter: Sirf wahi players dikhao jo user ki team mein hain AUR Admin ne C/VC designate kiye hain
+    admin_cv_list = players_info.get('cv', []) # Admin designated candidates
+    user_selected_names = []
+    for r in ['bat', 'wk', 'ar', 'bowl']:
+        user_selected_names.extend(team.get(r, []))
+
+    # Intersection of User Team and Admin designated C/VCs
+    available_candidates = [p for p in admin_cv_list if p['name'] in user_selected_names]
     
-    markup = types.InlineKeyboardMarkup(row_width=1) # Changed to row_width=1 for better display of C/VC status
-    for p in all_players:
-        d_name = display_map.get(p, p)
-        markup.add(
-            types.InlineKeyboardButton(f"👑 C: {d_name}", callback_data=f"cv_{match_id}_{team_num}_c_{p.replace(' ', '_')}"),
-            types.InlineKeyboardButton(f"⭐ VC: {d_name}", callback_data=f"cv_{match_id}_{team_num}_vc_{p.replace(' ', '_')}")
+    markup = types.InlineKeyboardMarkup() 
+    for p_obj in available_candidates:
+        p_name = p_obj['name']
+        d_name = p_obj['display']
+        c_icon = "👑" if team.get('captain') == p_name else "⚪"
+        vc_icon = "⭐" if team.get('vice_captain') == p_name else "⚪"
+
+        # Row 1: Player Name
+        markup.row(types.InlineKeyboardButton(f"👤 {d_name}", callback_data="ignore"))
+        # Row 2: Inline C and VC buttons
+        markup.row(
+            types.InlineKeyboardButton(f"{c_icon} CAPTAIN", callback_data=f"cv_{match_id}_{team_num}_c_{p_name.replace(' ', '_')}"),
+            types.InlineKeyboardButton(f"{vc_icon} VICE-CAPTAIN", callback_data=f"cv_{match_id}_{team_num}_vc_{p_name.replace(' ', '_')}")
         )
+
+    if not available_candidates:
+        markup.row(types.InlineKeyboardButton("⚠️ No designated C/VC in your team!", callback_data="ignore"))
+
     markup.add(types.InlineKeyboardButton("🔙 BACK", callback_data=f"team_save_{match_id}_{team_num}"))
     
     bot.edit_message_text("🎯 *Select Captain (2x) and Vice-Captain (1.5x)*\n\n_Captain aur Vice-Captain same nahi ho sakte._", 
@@ -832,9 +856,17 @@ def callback_set_cv(call):
     name = "_".join(parts[4:]).replace('_', ' ')
     
     team = db_get_team(uid, match_id, team_num)
+    
+    # Basic Validation: C and VC cannot be same
     if type_cv == 'c':
+        if team.get('vice_captain') == name:
+            bot.answer_callback_query(call.id, "❌ Yeh player pehle se Vice-Captain hai!", show_alert=True)
+            return
         team['captain'] = name
     else:
+        if team.get('captain') == name:
+            bot.answer_callback_query(call.id, "❌ Yeh player pehle se Captain hai!", show_alert=True)
+            return
         team['vice_captain'] = name
     
     db_save_team(uid, team, match_id, team_num)
