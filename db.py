@@ -535,12 +535,12 @@ def get_live_ranks(match_id):
         """, (match_id,))
         return c.fetchall()
 
-def db_add_player(match_id, name, role, team='N/A'):
+def db_add_player(match_id, name, role, team='N/A', designation=''):
     with get_db() as c:
         c.execute(
-            """INSERT INTO PLAYERS (match_id, player_name, role, team) VALUES (%s, %s, %s, %s)
-               ON CONFLICT (match_id, player_name, team) DO UPDATE SET role = EXCLUDED.role""",
-            (match_id, name, role, team)
+            """INSERT INTO PLAYERS (match_id, player_name, role, team, designation) VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (match_id, player_name, team) DO UPDATE SET role = EXCLUDED.role, designation = EXCLUDED.designation""",
+            (match_id, name, role, team, designation)
         )
 
 def db_get_players_by_match(match_id):
