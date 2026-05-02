@@ -86,6 +86,7 @@ def admin_dashboard_home(stats, matches):
     fraud_btn_text = f"⚠️ Fraud Alerts ({stats['flagged']})" if stats['flagged'] > 0 else "⚠️ Fraud Alerts"
     markup.add(
         types.InlineKeyboardButton("📊 Funnel", callback_data="adm_nav_funnel"),
+        types.InlineKeyboardButton("👥 Recent Users", callback_data="adm_nav_recent"),
         types.InlineKeyboardButton("🔗 Referrals", callback_data="adm_nav_refs"),
         types.InlineKeyboardButton(fraud_btn_text, callback_data="adm_nav_fraud"),
         types.InlineKeyboardButton("🏆 Leaderboard", callback_data="adm_nav_lead"),
