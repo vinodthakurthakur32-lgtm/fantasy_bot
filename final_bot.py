@@ -2505,10 +2505,15 @@ def cmd_set_cv(msg):
     emoji = "👑" if key == 'captain' else "⭐"
     bot.reply_to(msg, f"{emoji} {name} set!")
 
-@bot.message_handler(commands=['admin_panel'])
+@bot.message_handler(commands=['admin_panel', 'recent_users'])
 def cmd_admin(msg):
     if not is_admin(msg.from_user.id):
         bot.reply_to(msg, f"🚫 **Access Denied!**\nAapka User ID (`{msg.from_user.id}`) admin list mein nahi hai.\n\nCheck `.env` file and set `ADMIN_ID={msg.from_user.id}`", parse_mode='Markdown')
+        return
+    if msg.text.startswith('/recent_users'):
+        # Redirect to recent users view
+        call_mock = types.CallbackQuery(None, msg.from_user, "adm_nav_recent", msg, None)
+        handle_admin_nav(call_mock, bot)
         return
     try:
         stats = db.get_admin_stats()
