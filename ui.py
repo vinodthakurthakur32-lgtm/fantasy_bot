@@ -1,492 +1,754 @@
-import html
-import time
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
+from dotenv import load_dotenv # Added for local .env support
+import json
+import logging
+import secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from telebot import types
-import db
 
-def get_loading_render(progress):
-    fill = int(progress / 10)
-    bar = "█" * fill + "▒" * (10 - fill)
-    return f"⏳ *Loading System Components...*\n\n`{bar}` {progress}%"
+# Load environment variables from .env file (for local development)
+load_dotenv()
 
-def fake_animate(bot, chat_id, message_id):
-    for p in [20, 50, 80, 100]:
+# Render provides the database URL in an environment variable
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Simple In-memory cache for settings to improve speed
+_settings_cache = {}
+_manual_prizes_cache = {}
+
+@contextmanager
+def get_db():
+    if not DATABASE_URL:
+        logging.error("❌ DATABASE_URL is not set. Check your .env file.")
+        raise ValueError("DATABASE_URL environment variable is missing.")
+    # Connect to PostgreSQL
+    try:
+        # Explicitly setting sslmode=require for Supabase
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, sslmode='require')
+    except psycopg2.OperationalError as e:
+        if "could not translate host name" in str(e):
+            logging.error("❌ DNS Error: Cannot find the database host. Is your Supabase project PAUSED?")
+            raise ConnectionError("Supabase project might be paused. Please check your Supabase dashboard.") from e
+        else:
+            logging.error(f"❌ Failed to connect to the database: {e}")
+            raise
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def init_db():
+    with get_db() as c:
+        # 1. Create Tables (if not exist)
+        c.execute('''CREATE TABLE IF NOT EXISTS USERS (
+            user_id VARCHAR(255) PRIMARY KEY, username TEXT, first_name TEXT, joined_date TEXT,
+            referred_by VARCHAR(255) DEFAULT NULL,
+            last_seen TEXT DEFAULT 'N/A', 
+            paid INTEGER DEFAULT 0,
+            total_added NUMERIC DEFAULT 0,
+            total_used NUMERIC DEFAULT 0,
+            is_flagged INTEGER DEFAULT 0
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS TEAMS (
+            user_id VARCHAR(255), match_id VARCHAR(255), team_players TEXT, captain TEXT, vice_captain TEXT,
+            team_saved INTEGER DEFAULT 0, team_num INTEGER DEFAULT 1,
+            is_paid INTEGER DEFAULT 0, points INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, match_id, team_num)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS PAYMENTS (
+            id SERIAL PRIMARY KEY, user_id VARCHAR(255), amount INTEGER,
+            match_id VARCHAR(255), upi_txn_id TEXT, timestamp TEXT, status VARCHAR(50) DEFAULT 'pending'
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS PAYMENT_INTENTS (
+            id SERIAL PRIMARY KEY, order_id VARCHAR(255), user_id VARCHAR(255), amount INTEGER,
+            match_context TEXT, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS USED_UTR (
+            utr VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255), amount INTEGER, timestamp TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS LEDGER (
+            id SERIAL PRIMARY KEY, user_id VARCHAR(255), amount NUMERIC,
+            type VARCHAR(50), reference_id VARCHAR(255) UNIQUE, timestamp TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS MATCHES_LIST (
+            match_id VARCHAR(255) PRIMARY KEY, name TEXT, type TEXT, deadline TEXT,
+            points_calculated INTEGER DEFAULT 0, manual_lock INTEGER DEFAULT 0,
+            live_link TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS PLAYERS (
+            id SERIAL PRIMARY KEY,
+            match_id VARCHAR(255),
+            player_name TEXT,
+            role TEXT,
+            team TEXT DEFAULT 'N/A',
+            designation TEXT DEFAULT '',
+            UNIQUE(match_id, player_name, team)
+        )''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_match_players ON PLAYERS(match_id)")
+        c.execute('''CREATE TABLE IF NOT EXISTS FAILED_UTR_LOGS (
+            user_id VARCHAR(255), utr TEXT, timestamp TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS WITHDRAWALS (
+            id SERIAL PRIMARY KEY, user_id VARCHAR(255), amount NUMERIC,
+            upi_id TEXT, status VARCHAR(50) DEFAULT 'pending', timestamp TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS CONTEST_CONFIG (
+            match_id VARCHAR(255), entry_fee INTEGER, max_slots INTEGER,
+            PRIMARY KEY (match_id, entry_fee)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS MANUAL_PRIZES (
+            match_id VARCHAR(255),
+            entry_fee INTEGER,
+            r1 INTEGER,
+            r2 INTEGER,
+            r3 INTEGER,
+            r4_10 INTEGER,
+            bottom INTEGER,
+            winners_count INTEGER,
+            PRIMARY KEY (match_id, entry_fee)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS SETTINGS (
+            key VARCHAR(255) PRIMARY KEY,
+            value TEXT
+        )''')
+        # Track individual player performance per match
+        c.execute('''CREATE TABLE IF NOT EXISTS PLAYER_LIVE_STATS (
+            match_id VARCHAR(255),
+            player_name TEXT,
+            runs INTEGER DEFAULT 0,
+            fours INTEGER DEFAULT 0,
+            sixes INTEGER DEFAULT 0,
+            wickets INTEGER DEFAULT 0,
+            PRIMARY KEY (match_id, player_name)
+        )''')
+        # Audit log for every scoring event
+        c.execute('''CREATE TABLE IF NOT EXISTS MATCH_EVENTS (
+            id SERIAL PRIMARY KEY,
+            match_id VARCHAR(255),
+            player_name TEXT,
+            event_type TEXT,
+            points_awarded NUMERIC,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        # FIX 3: Add USER_STATE table for persistence
+        c.execute('''CREATE TABLE IF NOT EXISTS USER_STATE (
+            user_id VARCHAR(255),
+            key VARCHAR(255),
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, key)
+        )''')
+
+        # FEATURE 1: Add REMINDERS table
+        c.execute('''CREATE TABLE IF NOT EXISTS REMINDERS (
+            id SERIAL PRIMARY KEY,
+            match_id TEXT,
+            user_id TEXT,
+            reminder_type TEXT,
+            sent_at TEXT
+        )''')
+        # FEATURE 4: Add SUPPORT_TICKETS table
+        c.execute('''CREATE TABLE IF NOT EXISTS SUPPORT_TICKETS (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            issue TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TEXT,
+            resolved_at TEXT
+        )''')
+
+def db_set_setting(key, value):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO SETTINGS (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (key, str(value)))
+    # Invalidate cache
+    if key in _settings_cache:
+        del _settings_cache[key]
+
+def db_get_setting(key, default=None):
+    if key in _settings_cache:
+        return _settings_cache[key]
+    with get_db() as c:
+        c.execute("SELECT value FROM SETTINGS WHERE key=%s", (key,))
+        row = c.fetchone()
+        val = row['value'] if row else default
+        _settings_cache[key] = val
+        return val
+
+def db_set_contest_config(mid, fee, slots):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO CONTEST_CONFIG (match_id, entry_fee, max_slots) VALUES (%s, %s, %s)
+            ON CONFLICT (match_id, entry_fee) DO UPDATE SET max_slots = EXCLUDED.max_slots
+        """, (mid, fee, slots))
+
+def db_get_contest_config(mid, fee):
+    with get_db() as c:
+        c.execute("SELECT * FROM CONTEST_CONFIG WHERE match_id=%s AND entry_fee=%s", (mid, fee))
+        return c.fetchone()
+
+def db_set_manual_prizes(mid, fee, r1, r2, r3, r4_10, bottom, winners):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO MANUAL_PRIZES (match_id, entry_fee, r1, r2, r3, r4_10, bottom, winners_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (match_id, entry_fee) DO UPDATE SET
+            r1=EXCLUDED.r1, r2=EXCLUDED.r2, r3=EXCLUDED.r3, r4_10=EXCLUDED.r4_10, 
+            bottom=EXCLUDED.bottom, winners_count=EXCLUDED.winners_count
+        """, (mid, fee, r1, r2, r3, r4_10, bottom, winners))
+    # Invalidate cache
+    cache_key = f"{mid}_{fee}"
+    if cache_key in _manual_prizes_cache:
+        del _manual_prizes_cache[cache_key]
+
+def db_get_manual_prizes(mid, fee):
+    cache_key = f"{mid}_{fee}"
+    if cache_key in _manual_prizes_cache:
+        return _manual_prizes_cache[cache_key]
+    with get_db() as c:
+        c.execute("SELECT * FROM MANUAL_PRIZES WHERE match_id=%s AND entry_fee=%s", (mid, fee))
+        res = c.fetchone()
+        _manual_prizes_cache[cache_key] = res
+        return res
+
+def db_get_recent_users_stats(limit=10):
+    """Fetches recently joined users and their team counts without file download"""
+    with get_db() as c:
+        c.execute("""
+            SELECT u.user_id, u.first_name, u.username, u.joined_date,
+            (SELECT COUNT(*) FROM TEAMS WHERE user_id = u.user_id AND team_saved=1) as team_count
+            FROM USERS u
+            ORDER BY u.joined_date DESC LIMIT %s
+        """, (limit,))
+        return c.fetchall()
+
+def db_delete_contest(mid, fee):
+    """Admin can remove a specific contest configuration"""
+    with get_db() as c:
+        c.execute("DELETE FROM CONTEST_CONFIG WHERE match_id=%s AND entry_fee=%s", (mid, fee))
+
+def db_get_all_contest_configs(mid):
+    with get_db() as c:
+        c.execute("SELECT * FROM CONTEST_CONFIG WHERE match_id=%s", (mid,))
+        return c.fetchall()
+
+def db_cleanup_unpaid_teams(match_id):
+    """Deletes all teams for a match that were never paid/joined"""
+    with get_db() as c:
+        c.execute("DELETE FROM TEAMS WHERE match_id=%s AND is_paid=0", (match_id,))
+    logging.info(f"🧹 Cleanup: Unpaid teams removed for match {match_id}")
+
+def db_add_match(mid, name, m_type, deadline, points_calculated=0, manual_lock=0):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO MATCHES_LIST (match_id, name, type, deadline, points_calculated, manual_lock) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (match_id) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type, deadline = EXCLUDED.deadline, points_calculated = EXCLUDED.points_calculated, manual_lock = EXCLUDED.manual_lock
+        """, (mid, name, m_type, deadline, points_calculated, manual_lock))
+
+def db_get_matches():
+    with get_db() as c:
+        c.execute("SELECT * FROM MATCHES_LIST")
+        return c.fetchall()
+
+def run_migrations():
+    with get_db() as c:
+        migrations = {
+            "USERS": [
+                ("last_seen", "TEXT DEFAULT 'N/A'"),
+                ("paid", "INTEGER DEFAULT 0"),
+                ("is_flagged", "INTEGER DEFAULT 0"),
+                ("referred_by", "VARCHAR(255) DEFAULT NULL")
+            ],
+            "PAYMENT_INTENTS": [
+                ("order_id", "VARCHAR(255)")
+            ],
+            "TEAMS": [
+                ("is_paid", "INTEGER DEFAULT 0"),
+                ("points", "INTEGER DEFAULT 0")
+            ],
+            "MATCHES_LIST": [
+                ("points_calculated", "INTEGER DEFAULT 0"), 
+                ("manual_lock", "INTEGER DEFAULT 0"),
+                ("live_link", "TEXT")
+            ],
+            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'"), ("designation", "TEXT DEFAULT ''")]
+        }
+        for table, cols in migrations.items():
+            c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table.lower(),))
+            existing = [row['column_name'] for row in c.fetchall()]
+            for col_name, col_def in cols:
+                if col_name not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+        
+        # Constraints check for Postgres
         try:
-            bot.edit_message_text(get_loading_render(p), chat_id, message_id, parse_mode='Markdown')
-            time.sleep(0.3)
-        except: pass
+            c.execute("ALTER TABLE PLAYERS DROP CONSTRAINT IF EXISTS players_match_id_player_name_key")
+            c.execute("ALTER TABLE PLAYERS DROP CONSTRAINT IF EXISTS players_match_id_player_name_team_key")
+            
+            c.execute("DELETE FROM PLAYERS a USING PLAYERS b WHERE a.id < b.id AND a.match_id = b.match_id AND a.player_name = b.player_name AND COALESCE(a.team, 'N/A') = COALESCE(b.team, 'N/A')")
+            c.execute("ALTER TABLE PLAYERS ADD CONSTRAINT players_match_id_player_name_team_key UNIQUE (match_id, player_name, team)")
+        except Exception as e:
+            logging.warning(f"Constraint migration info: {e}")
 
-def home_screen_markup(matches):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for mid, info in matches.items():
-        markup.add(types.InlineKeyboardButton(f"🏏 {info['name']} (Live)", callback_data=f"app_match_{mid}"))
-    
-    markup.row(
-        types.InlineKeyboardButton("💰 Wallet", callback_data="app_wallet"),
-        types.InlineKeyboardButton("🏆 Ranks", callback_data="app_global_ranks")
-    )
-    return markup, "📱 *CRICK-TEAM11 DASHBOARD*\n\nSelect a live match to view real-time scoring and your standing."
+    logging.info("✅ Database Migrations completed.")
 
-def match_screen_markup(match_id, match_name, ranks):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    rank_text = "🏆 *LIVE LEADERBOARD*\n"
-    if not ranks:
-        rank_text += "_No points recorded yet._"
-    for i, r in enumerate(ranks[:5], 1):
-        medal = "🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else "🔹"
-        rank_text += f"{medal} {r['first_name']} - {r['points']} pts\n"
+def db_get_user(user_id):
+    with get_db() as c:
+        c.execute("SELECT * FROM USERS WHERE user_id=%s", (str(user_id),))
+        return c.fetchone()
 
-    markup.add(
-        types.InlineKeyboardButton("🔄 Refresh Score", callback_data=f"app_match_{match_id}"),
-        types.InlineKeyboardButton("🏠 Home", callback_data="app_home")
-    )
-    
-    body = f"🏟 *MATCH:* {match_name}\n\n{rank_text}"
-    return markup, body
+def db_register_user_optimized(user_id, username, first_name):
+    """
+    Optimized user registration: Single connection check, create, and update last_seen.
+    Returns (is_new_user, user_data)
+    """
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    uid_str = str(user_id)
+    with get_db() as c:
+        # 1. Check if user exists
+        c.execute("SELECT * FROM USERS WHERE user_id=%s", (uid_str,))
+        user = c.fetchone()
+        
+        if not user:
+            # 2. Create new user
+            c.execute("""
+                INSERT INTO USERS (user_id, username, first_name, joined_date, last_seen, is_flagged) 
+                VALUES (%s, %s, %s, %s, %s, 0)
+            """, (uid_str, username, first_name, now, now))
+            # Fetch the newly created user
+            c.execute("SELECT * FROM USERS WHERE user_id=%s", (uid_str,))
+            return True, c.fetchone()
+        else:
+            # 3. Just update last_seen
+            c.execute("UPDATE USERS SET last_seen = %s WHERE user_id = %s", (now, uid_str))
+            return False, user
 
-def lock_screen_markup():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🏠 Return Home", callback_data="app_home"))
-    return markup, "🔒 *MATCH LOCKED*\n\nThe deadline has passed. Team editing is disabled. Live points are being calculated."
+def db_reward_referrer(referrer_id, new_user_id, amount=10):
+    """Referrer ke ledger mein bonus credit karta hai agar wo already rewarded nahi hai"""
+    with get_db() as c:
+        ref_id = f"REF_BONUS_{new_user_id}"
+        # Idempotency check: Ek user ke referral ka bonus ek hi baar milna chahiye
+        c.execute("SELECT id FROM LEDGER WHERE reference_id=%s", (ref_id,))
+        exists = c.fetchone()
+        if not exists:
+            c.execute(
+                "INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'CREDIT', %s, %s)",
+                (str(referrer_id), amount, ref_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            return True
+        return False
 
-def admin_match_finance_render(match_id, match_name, fin_data):
-    comm_pct = float(db.db_get_setting('PRIZE_COMMISSION', 10))
-    total_collection = fin_data['collection']
-    admin_cut = (total_collection * comm_pct) / 100
-    prize_pool = total_collection - admin_cut
-    
-    res = (
-        f"💰 *FINANCIAL SUMMARY: {match_name}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Total Collection: `₹{total_collection}`\n"
-        f"✂️ Admin Cut ({comm_pct}%): `₹{admin_cut}`\n"
-        f"🎁 Total Prize Pool: `₹{prize_pool}`\n"
-        f"👥 Paid Entries: `{fin_data['entries']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *PRIZE BREAKDOWN (Per Contest Type):*\n"
-    )
-    
-    for cfg in fin_data['configs']:
-        bd = get_prize_breakdown(cfg['entry_fee'], cfg['max_slots'], match_id=match_id)
-        res += (
-            f"\n📍 *Contest ₹{cfg['entry_fee']} ({cfg['max_slots']} slots):*\n"
-            f"🥇 1st: ₹{bd['1st']} | 🥈 2nd: ₹{bd['2nd']}\n"
-            f"🥉 3rd: ₹{bd['3rd']} | 🏅 4-10: ₹{bd['4-10']}\n"
+def db_update_last_seen(user_id):
+    with get_db() as c:
+        c.execute("UPDATE USERS SET last_seen = %s WHERE user_id = %s", 
+                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), str(user_id)))
+
+def db_log_failed_utr(user_id, utr):
+    with get_db() as c:
+        c.execute("INSERT INTO FAILED_UTR_LOGS (user_id, utr, timestamp) VALUES (%s, %s, %s)",
+                     (str(user_id), utr, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+def db_get_failed_utr_count(user_id):
+    with get_db() as c:
+        c.execute("SELECT COUNT(*) as cnt FROM FAILED_UTR_LOGS WHERE user_id=%s", (str(user_id),))
+        row = c.fetchone()
+        return row['cnt'] if row and 'cnt' in row else row[0] if row else 0
+
+# FIX 3: Helper functions for user state persistence
+def db_set_user_state(user_id, key, value):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO USER_STATE (user_id, key, value) VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+        """, (str(user_id), key, str(value)))
+
+def db_get_user_state(user_id, key):
+    with get_db() as c:
+        c.execute("SELECT value FROM USER_STATE WHERE user_id=%s AND key=%s", (str(user_id), key))
+        row = c.fetchone()
+        return row['value'] if row else None
+
+def db_flag_user(user_id, status=1):
+    with get_db() as c:
+        c.execute("UPDATE USERS SET is_flagged = %s WHERE user_id = %s", (status, str(user_id)))
+
+def db_get_all_user_teams(user_id, match_id):
+    """Ek hi baar mein user ki saari teams fetch karta hai (Performance optimization)"""
+    try:
+        with get_db() as c:
+            c.execute("SELECT * FROM TEAMS WHERE user_id=%s AND match_id=%s", (str(user_id), match_id))
+            return c.fetchall()
+    except Exception as e:
+        logging.error(f"Error fetching all teams: {e}")
+        return []
+
+def db_get_team_internal(user_id, match_id='m1', team_num=1):
+    try:
+        with get_db() as c:
+            c.execute("SELECT * FROM TEAMS WHERE user_id=%s AND match_id=%s AND team_num=%s", (str(user_id), match_id, team_num))
+            row = c.fetchone()
+            if row:
+                data = json.loads(row['team_players']) if row['team_players'] else {}
+                data['captain'] = row['captain']
+                data['vice_captain'] = row['vice_captain']
+                data['team_saved'] = row['team_saved']
+                data['is_paid'] = row['is_paid']
+                data['points'] = row['points']
+                return data
+            return None
+    except Exception as e:
+        logging.error(f"Error getting team internal: {e}")
+        return None
+
+def db_get_team_status(user_id, match_id, team_num):
+    """Returns the status of a specific team slot"""
+    with get_db() as c:
+        c.execute(
+            "SELECT team_saved, is_paid FROM TEAMS WHERE user_id=%s AND match_id=%s AND team_num=%s",
+            (str(user_id), match_id, team_num))
+        row = c.fetchone()
+        if not row: return "empty"
+        if row['team_saved'] and row['is_paid']: return "paid"
+        if row['team_saved']: return "unpaid"
+        return "empty"
+
+def db_create_order(user_id, amount, context="wallet"):
+    order_id = f"ORD-{secrets.token_hex(4).upper()}"
+    now = datetime.now()
+    expires = now + timedelta(minutes=60)
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO PAYMENT_INTENTS (order_id, user_id, amount, match_context, created_at, expires_at) VALUES (%s, %s, %s, %s, %s, %s)",
+            (order_id, str(user_id), amount, context, now.strftime('%Y-%m-%d %H:%M:%S'), expires.strftime('%Y-%m-%d %H:%M:%S'))
+        )
+    return order_id
+
+def db_get_order(order_id):
+    with get_db() as c:
+        c.execute("SELECT * FROM PAYMENT_INTENTS WHERE order_id=%s", (order_id,))
+        return c.fetchone()
+
+def get_admin_stats():
+    """Calculates real-time summary for Dashboard"""
+    with get_db() as c:
+        now = datetime.now()
+        today = now.strftime('%Y-%m-%d')
+        five_mins_ago = (now - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        c.execute("SELECT COUNT(*) as cnt FROM USERS"); total = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE last_seen > %s", (five_mins_ago,)); active = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE joined_date LIKE %s", (f"{today}%",)); new_today = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM TEAMS WHERE is_paid=1"); paid = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM USERS WHERE is_flagged=1"); flagged = c.fetchone()['cnt']
+        
+        conv_rate = (paid / total * 100) if total > 0 else 0
+        
+        return {
+            "total": total, "active": active, "new": new_today, 
+            "paid": paid, "conv": round(conv_rate, 1), "flagged": flagged
+        }
+
+def db_get_match_financials(match_id):
+    """Calculates total collection and stats based on actual paid entries in Ledger"""
+    with get_db() as c:
+        # Find all DEBIT entries in Ledger related to this match join
+        # reference_id format is 'DEBIT_MATCH_{match_id}_{team_num}_{timestamp}'
+        search_pattern = f"DEBIT_MATCH_{match_id}_%"
+        c.execute("""
+            SELECT ABS(SUM(amount)) as total_collection, COUNT(*) as total_entries 
+            FROM LEDGER 
+            WHERE type='DEBIT' AND reference_id LIKE %s
+        """, (search_pattern,))
+        row = c.fetchone()
+        
+        # Get all distinct entry fees joined for this match to show prize breakdowns
+        c.execute("""
+            SELECT DISTINCT entry_fee, max_slots 
+            FROM CONTEST_CONFIG 
+            WHERE match_id=%s
+        """, (match_id,))
+        configs = c.fetchall()
+        
+        return {
+            "collection": float(row['total_collection']) if row and row['total_collection'] else 0,
+            "entries": row['total_entries'] if row else 0,
+            "configs": configs
+        }
+
+def get_contest_stats(match_id, entry_fee=100):
+    """Fetches real-time participation stats for a match dashboard"""
+    with get_db() as c:
+        # Real count from database
+        c.execute("SELECT COUNT(*) as count FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
+        real_joined = c.fetchone()['count']
+
+        fake_base = int(db_get_setting('FAKE_PARTICIPANTS_BASE', 0))
+        c.execute("SELECT max_slots FROM CONTEST_CONFIG WHERE match_id=%s AND entry_fee=%s", (match_id, entry_fee))
+        cfg = c.fetchone()
+        max_slots = cfg['max_slots'] if cfg else 50 # Default 50 slots
+        
+        # Check for manual prize pool override
+        c.execute("SELECT * FROM MANUAL_PRIZES WHERE match_id=%s AND entry_fee=%s", (match_id, entry_fee))
+        manual = c.fetchone()
+        if manual:
+            prize_pool = manual['r1'] + manual['r2'] + manual['r3'] + (manual['r4_10'] * 7) + (manual['bottom'] * (manual['winners_count'] - 10))
+        else:
+            # Fallback to automatic 90% payout logic
+            prize_pool = max_slots * entry_fee * 0.9
+            
+        # Agar fake_base 0 hai toh asli data dikhao, warna marketing logic lagao
+        if fake_base > 0:
+            total_joined = min(real_joined + fake_base, max_slots) 
+        else:
+            total_joined = real_joined
+            
+        return {"joined": total_joined, "max_slots": max_slots, "prize_pool": int(prize_pool)}
+
+def get_user_match_summary(user_id, match_id):
+    """Calculates user-specific stats for a specific match"""
+    with get_db() as c:
+        c.execute("SELECT team_num, team_saved, is_paid FROM TEAMS WHERE user_id=%s AND match_id=%s", 
+                             (str(user_id), match_id))
+        teams = c.fetchall()
+        saved = [t['team_num'] for t in teams if t['team_saved'] == 1]
+        paid = [t['team_num'] for t in teams if t['is_paid'] == 1]
+        incomplete = [t['team_num'] for t in teams if t['team_saved'] == 0]
+        return {"saved": saved, "paid": paid, "incomplete": incomplete}
+
+def get_funnel_data():
+    """Calculates user journey drop-offs"""
+    with get_db() as c:
+        c.execute("SELECT COUNT(*) FROM USERS"); total = c.fetchone()['count']
+        # Users who at least opened the selection UI (temp_team_cache or TEAMS entry)
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM TEAMS"); started_team = c.fetchone()['count']
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM TEAMS WHERE team_saved=1"); saved_team = c.fetchone()['count']
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM TEAMS WHERE is_paid=1"); paid_contest = c.fetchone()['count']
+        
+        return [total, started_team, saved_team, paid_contest]
+
+def get_referral_analytics():
+    with get_db() as c:
+        c.execute("""
+            SELECT referred_by, COUNT(*) as count 
+            FROM USERS WHERE referred_by IS NOT NULL 
+            GROUP BY referred_by ORDER BY count DESC LIMIT 5
+        """)
+        return c.fetchall()
+
+def get_fraud_list():
+    with get_db() as c:
+        # Sirf flagged users ya suspicious high activity dikhayein
+        c.execute("""
+            SELECT u.user_id, u.first_name, u.username, 
+            (SELECT COUNT(*) FROM USED_UTR WHERE user_id = u.user_id) as utr_count
+            FROM USERS u 
+            WHERE u.is_flagged = 1
+            ORDER BY utr_count DESC LIMIT 10
+        """)
+        return c.fetchall()
+
+def db_get_wallet_balance(user_id):
+    with get_db() as c:
+        c.execute("SELECT SUM(amount) as bal FROM LEDGER WHERE user_id=%s", (str(user_id),))
+        row = c.fetchone()
+        return float(row['bal']) if row and row['bal'] else 0
+
+def get_live_ranks(match_id):
+    with get_db() as c:
+        c.execute("""
+            SELECT u.username, u.first_name, t.points 
+            FROM TEAMS t 
+            JOIN USERS u ON t.user_id = u.user_id 
+            WHERE t.match_id = %s 
+            ORDER BY t.points DESC 
+            LIMIT 10
+        """, (match_id,))
+        return c.fetchall()
+
+def db_add_player(match_id, name, role, team='N/A', designation=''):
+    with get_db() as c:
+        c.execute(
+            """INSERT INTO PLAYERS (match_id, player_name, role, team, designation) VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (match_id, player_name, team) DO UPDATE SET role = EXCLUDED.role, designation = EXCLUDED.designation""",
+            (match_id, name, role, team, designation)
         )
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_fin_{match_id}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="adm_nav_home"))
-    return markup, res
+def db_get_players_by_match(match_id):
+    """Fetches the squad (names and roles) for a given match."""
+    with get_db() as c:
+        c.execute("SELECT player_name, role, team FROM PLAYERS WHERE match_id=%s", (match_id,))
+        return c.fetchall()
 
-def admin_dashboard_home(stats, matches):
-    """Admin Dashboard ka main menu dikhata hai"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    fraud_btn_text = f"⚠️ Fraud Alerts ({stats['flagged']})" if stats['flagged'] > 0 else "⚠️ Fraud Alerts"
-    markup.add(
-        types.InlineKeyboardButton("📊 Funnel", callback_data="adm_nav_funnel"),
-        types.InlineKeyboardButton("👥 Recent Users", callback_data="adm_nav_recent"),
-        types.InlineKeyboardButton("🔗 Referrals", callback_data="adm_nav_refs"),
-        types.InlineKeyboardButton(fraud_btn_text, callback_data="adm_nav_fraud"),
-        types.InlineKeyboardButton("🏆 Leaderboard", callback_data="adm_nav_lead"),
-    )
-    markup.add(
-        types.InlineKeyboardButton("📤 Data Backup", callback_data="adm_export_data"),
-        types.InlineKeyboardButton("🛠 Setup Guide", callback_data="adm_nav_help"),
-        types.InlineKeyboardButton("🔄 Refresh Data", callback_data="adm_nav_home")
-    )
-    # Add match control buttons
-    if matches:
-        markup.add(types.InlineKeyboardButton("━━━━━━━━━━━━━━", callback_data="ignore"))
-        for mid, info in matches.items():
-            markup.row(
-                types.InlineKeyboardButton(f"🎮 Control: {info['name']}", callback_data=f"adm_ctrl_{mid}"),
-                types.InlineKeyboardButton("💰 Finance", callback_data=f"adm_fin_{mid}")
+def db_get_player_count(match_id):
+    """Returns the total number of players added to a specific match"""
+    with get_db() as c:
+        c.execute("SELECT COUNT(*) as cnt FROM PLAYERS WHERE match_id=%s", (match_id,))
+        row = c.fetchone()
+        return row['cnt'] if row else 0
+
+def db_delete_player(match_id, name):
+    with get_db() as c:
+        c.execute(
+            "DELETE FROM PLAYERS WHERE match_id=%s AND player_name=%s",
+            (match_id, name)
+        )
+
+def db_get_user_payment_history(user_id, limit=10):
+    """Fetches list of all payment attempts (screenshots) by a user"""
+    with get_db() as c:
+        c.execute(
+            "SELECT amount, status, timestamp FROM PAYMENTS WHERE user_id=%s ORDER BY timestamp DESC LIMIT %s",
+            (str(user_id), limit))
+        return c.fetchall()
+
+# ADD 1: Get transaction history from LEDGER
+def db_get_transaction_history(user_id, limit=10):
+    with get_db() as c:
+        c.execute("""
+            SELECT type, amount, reference_id, timestamp 
+            FROM LEDGER WHERE user_id=%s 
+            ORDER BY timestamp DESC LIMIT %s
+        """, (str(user_id), limit))
+        return c.fetchall()
+
+# ADD 3: Get Referral Stats
+def db_get_referral_stats(user_id):
+    with get_db() as c:
+        c.execute("SELECT COUNT(*) as total FROM USERS WHERE referred_by=%s", (str(user_id),))
+        total = c.fetchone()['total']
+        c.execute("SELECT SUM(amount) as bonus FROM LEDGER WHERE user_id=%s AND reference_id LIKE 'REF_BONUS_%%'", (str(user_id),))
+        bonus = c.fetchone()['bonus'] or 0
+        return {"total": total, "bonus": bonus}
+
+# ADD 4: Update withdrawal status stage
+def db_update_withdrawal_status(req_id, status):
+    with get_db() as c:
+        c.execute("UPDATE WITHDRAWALS SET status=%s WHERE id=%s", (status, req_id))
+
+# FEATURE 1: Reminder System Helpers
+def db_get_users_without_team(match_id):
+    with get_db() as c:
+        c.execute("""
+            SELECT user_id FROM USERS 
+            WHERE user_id NOT IN (SELECT user_id FROM TEAMS WHERE match_id=%s AND team_saved=1)
+        """, (match_id,))
+        return [row['user_id'] for row in c.fetchall()]
+
+def db_get_users_unpaid_team(match_id):
+    with get_db() as c:
+        c.execute("""
+            SELECT user_id FROM TEAMS 
+            WHERE match_id=%s AND team_saved=1 AND is_paid=0
+        """, (match_id,))
+        return [row['user_id'] for row in c.fetchall()]
+
+def db_mark_reminder_sent(match_id, user_id, reminder_type):
+    with get_db() as c:
+        c.execute("""
+            INSERT INTO REMINDERS (match_id, user_id, reminder_type, sent_at) 
+            VALUES (%s, %s, %s, %s)
+        """, (match_id, user_id, reminder_type, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+def db_was_reminder_sent(match_id, user_id, reminder_type):
+    with get_db() as c:
+        c.execute("""
+            SELECT 1 FROM REMINDERS 
+            WHERE match_id=%s AND user_id=%s AND reminder_type=%s
+        """, (match_id, user_id, reminder_type))
+        return c.fetchone() is not None
+
+# FEATURE 3: Re-engagement Notification Helpers
+def db_get_inactive_users(days=3):
+    with get_db() as c:
+        three_days_ago = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("""
+            SELECT user_id, first_name FROM USERS 
+            WHERE last_seen < %s 
+            AND user_id NOT IN (
+                SELECT DISTINCT user_id FROM REMINDERS 
+                WHERE reminder_type='reengagement' AND sent_at > %s
             )
-            
-    markup.add(types.InlineKeyboardButton("🔙 EXIT ADMIN", callback_data="app_home"))
-    
-    text = (
-        "📊 <b>ADMIN DASHBOARD</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"👥 Users: <code>{stats['total']}</code> | 🟢 Live: <code>{stats['active']}</code>\n"
-        f"🆕 Today: <code>{stats['new']}</code> | 🚨 Fraud: <code>{stats['flagged']}</code>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"💳 Paid: <code>{stats['paid']}</code> | 📈 Conv: <code>{stats['conv']}%</code>\n"
-        "━━━━━━━━━━━━━━\n"
-        "🔄 <i>Click Refresh for updates</i>"
-    )
-    return markup, text
+        """, (three_days_ago, seven_days_ago))
+        return c.fetchall()
 
-def admin_help_render():
-    """Admin help guide return karta hai"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 BACK TO DASHBOARD", callback_data="adm_nav_home"))
-    
-    text = """
-🛠 <b>ADMIN CONTROL CENTER</b>
-━━━━━━━━━━━━━━━━━━━━
+# FEATURE 4: Support Ticket System Helpers
+def db_create_ticket(user_id, issue):
+    with get_db() as c:
+        c.execute("INSERT INTO SUPPORT_TICKETS (user_id, issue, created_at) VALUES (%s, %s, %s) RETURNING id",
+                  (user_id, issue, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        return c.fetchone()['id']
 
-🚀 <b>QUICK ACTIONS</b>
-• <code>/admin_panel</code> - Main Dashboard
-• <code>/broadcast</code> - Sabhi ko message bhein
-• <code>/export_data</code> - Pura data backup lein
+def db_resolve_ticket(ticket_id):
+    with get_db() as c:
+        c.execute("UPDATE SUPPORT_TICKETS SET status='resolved', resolved_at=%s WHERE id=%s",
+                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), ticket_id))
 
-🏏 <b>MATCH SETUP FLOW (Step-by-Step)</b>
-1️⃣ <code>/add_match</code> - Naya match details banayein
-2️⃣ <code>/add_player</code> - Players add karein (RR vs DC)
-   <i>Format: Name | Role | Desig | Team</i>
-• <code>/set_live_link</code> - <b>(NEW)</b> Streaming link set karein
-   <i>Ex: m1 | https://aapka-streaming-link.com</i>
-3️⃣ <code>/setup_contests</code> - Ek sath Mega/Med/Small set karein
+# FEATURE 5: Live Rank Helpers
+def db_get_user_rank(user_id, match_id):
+    with get_db() as c:
+        c.execute("""
+            SELECT rank FROM (
+                SELECT user_id, points,
+                RANK() OVER (ORDER BY points DESC) as rank
+                FROM TEAMS WHERE match_id=%s AND is_paid=1
+            ) ranked WHERE user_id=%s
+        """, (match_id, user_id))
+        return c.fetchone()
 
-🏆 <b>CONTESTS &amp; PLAYER MANAGEMENT</b>
-• <code>/delete_contest</code> - Particular contest hatayein
-• <code>/set_manual_prizes</code> - <b>(NEW)</b> Custom prize set karein
-  <i>Format: mid | fee | R1 | R2 | R3 | R4-10 | Bottom | Winners</i>
-• <code>/set_contest_size</code> - Single contest modify karein
-• <code>/set_prize_config</code> - Global commission/payout set karein
-• <code>/my_matches</code> - Dashboard se match/player control karein (Buttons)
-• <code>/list_players</code> - <b>(NEW)</b> Interactive Squad (Click karke delete karein)
-• <code>/edit_player_role</code> - Player ka role badlein
-• <code>/delete_player</code> - Squad se player nikalne ke liye
+def db_get_match_participant_count(match_id):
+    with get_db() as c:
+        c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
+        row = c.fetchone()
+        if not row: return 0
+        return row.get('cnt', 0) if isinstance(row, dict) else row[0]
 
-📈 <b>LIVE SCORING (REAL-TIME)</b>
-• <code>/up</code> - Fast point update (Ex: <code>/up Kohli 50</code>)
-• Admin Dashboard mein <b>Match Control</b> se 🔒 <b>LOCK / UNLOCK</b> karein.
-• <code>/myrank</code> - User rank check karein
+def db_get_all_player_scores(match_id):
+    """Returns a dictionary of all players and their current total points"""
+    with get_db() as c:
+        c.execute("""
+            SELECT player_name, (runs * 1 + fours * 4 + sixes * 6 + wickets * 25) as pts 
+            FROM PLAYER_LIVE_STATS WHERE match_id=%s
+        """, (match_id,))
+        rows = c.fetchall()
+        return {r['player_name']: r['pts'] for r in rows}
 
-⚙️ <b>ADVANCED SETTINGS</b>
-• <code>/set_fake_count</code> - <b>(HOT)</b> Display participants badhayein
-• <code>/set_handle</code> - Support/Channel links update karein
-• <code>/rules</code> - Point system update karein
-• <code>/clear_database</code> - ⚠️ Pura data saaf karein
-━━━━━━━━━━━━━━━━━━━━
-💡 <i>Naya match setup karne ke liye Step 1, 2, 3 follow karein.</i>"""
-    return markup, text
+def db_get_player_live_stats_map(match_id):
+    """Returns a dictionary of player_name -> full stats record"""
+    with get_db() as c:
+        c.execute("SELECT * FROM PLAYER_LIVE_STATS WHERE match_id=%s", (match_id,))
+        rows = c.fetchall()
+        return {r['player_name']: r for r in rows}
 
-def admin_funnel_render(funnel_counts):
-    steps = ["Start", "Team Init", "Team Save", "Payment"]
-    max_val = funnel_counts[0] if funnel_counts[0] > 0 else 1
-    
-    res = "📈 *USER CONVERSION FUNNEL*\n━━━━━━━━━━━━━━━━━━━━\n"
-    for i, count in enumerate(funnel_counts):
-        perc = int((count / max_val) * 100)
-        bar_len = int(perc / 10)
-        bar = "🟩" * bar_len + "⬜" * (10 - bar_len)
-        res += f"*{steps[i]}*\n`{bar}` {perc}%\n(Count: {count})\n\n"
-    
-    drop_off = 100 - int((funnel_counts[-1] / max_val) * 100) if max_val > 0 else 0
-    res += f"📉 *Overall Drop-off:* `{drop_off}%`"
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_nav_home"))
-    return markup, res
+def db_mark_points_calculated(match_id):
+    """Marks a match as having its points calculated"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 1 WHERE match_id = %s", (match_id,))
 
-def admin_fraud_render(fraud_list):
-    res = "⚠️ *FRAUD DETECTION PANEL*\n━━━━━━━━━━━━━━━━━━━━\n"
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    if not fraud_list:
-        res += "✅ No high-risk users detected."
-    else:
-        for user in fraud_list:
-            risk_icon = "🔴" if user['utr_count'] > 10 else "🟡"
-            res += f"{risk_icon} *{user['first_name']}*\n`ID: {user['user_id']}`\nStatus: Flagged 🚩\n\n"
-            markup.row(
-                types.InlineKeyboardButton(f"🚫 Block", callback_data=f"adm_act_block_{user['user_id']}"),
-                types.InlineKeyboardButton(f"✅ Clear Flag", callback_data=f"adm_act_unflag_{user['user_id']}")
-            )
-            
-    markup.add(types.InlineKeyboardButton("🔄 REFRESH LIST", callback_data="adm_nav_fraud"))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="adm_nav_home"))
-    return markup, res
+def db_set_manual_lock(match_id, status):
+    """0: Auto, 1: Force Lock, -1: Force Unlock"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET manual_lock = %s WHERE match_id = %s", (status, match_id))
 
-def admin_referral_render(top_refs):
-    res = "🔗 *REFERRAL INTELLIGENCE*\n━━━━━━━━━━━━━━━━━━━━\n"
-    if not top_refs:
-        res += "No referral data available."
-    else:
-        for i, ref in enumerate(top_refs, 1):
-            res += f"{i}. `ID:{ref[0]}` ➔ *{ref[1]} Invites*\n"
-            
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_nav_home"))
-    return markup, res
+def db_set_player_stats_absolute(match_id, player_name, runs=None, wickets=None):
+    """Directly sets total runs/wickets instead of incrementing"""
+    with get_db() as c:
+        if runs is not None:
+            c.execute("INSERT INTO PLAYER_LIVE_STATS (match_id, player_name, runs) VALUES (%s,%s,%s) ON CONFLICT(match_id, player_name) DO UPDATE SET runs = EXCLUDED.runs", (match_id, player_name, runs))
+        if wickets is not None:
+            c.execute("INSERT INTO PLAYER_LIVE_STATS (match_id, player_name, wickets) VALUES (%s,%s,%s) ON CONFLICT(match_id, player_name) DO UPDATE SET wickets = EXCLUDED.wickets", (match_id, player_name, wickets))
+    return True
 
-def payment_instructions_render(order_id, amount, upi_id):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(f"📋 Copy UPI: {upi_id}", callback_data=f"copy_upi_{upi_id}"),
-        types.InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_confirm_{order_id}"),
-        types.InlineKeyboardButton("❌ CANCEL ORDER", callback_data="app_home")
-    )
-    text = f"""
-💳 *SECURE PAYMENT*
-━━━━━━━━━━━━━━
-💰 Amount: *₹{amount}*
-🆔 Order ID: `{order_id}`
-━━━━━━━━━━━━━━
-1️⃣ Upar di gayi UPI ID par payment karein.
-2️⃣ **Payment ho jane ke baad**, uska Screenshot ya 12-digit UTR number yahan niche bhejein. ⚡
-3️⃣ Verification hote hi aapka balance update ho jayega.
-━━━━━━━━━━━━━━
-⚠️ Expiry: 60 mins
-"""
-    return markup, text
-
-def contest_list_render(matches):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    now = datetime.now()
-    
-    res = "🏆 *MATCHES*\n\n👉 *Next:* Select a match to join contests\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    for mid, info in matches.items():
-        deadline = info['deadline']
-        
-        # Logic moved here to avoid circular import with final_bot
-        m_lock = info.get('manual_lock', 0)
-        if m_lock == 1: 
-            is_locked = True
-        elif m_lock == -1: 
-            is_locked = False
-        else:
-            is_locked = datetime.now() > deadline
-            
-        time_left_delta = info['deadline'] - now
-
-        status_icon = "🔒" if is_locked else "⏳"
-
-        day_tag = "Today" if deadline.date() == now.date() else deadline.strftime('%d %b')
-        time_str = deadline.strftime('%I:%M %p')
-        
-        btn_text = f"{status_icon} {info['name']}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"show_match_{mid}"))
-
-    res += "\n⚠️ *No team?* \n👉 Pehle team banao niche buttons se."
-    return markup, res
-
-def get_prize_breakdown(fee, slots, custom_comm=None, match_id=None):
-    """Calculates distribution where all winners get >= fee and top ranks get surplus"""
-    if match_id:
-        manual = db.db_get_manual_prizes(match_id, fee)
-        if manual:
-            collection = fee * slots
-            pool = manual['r1'] + manual['r2'] + manual['r3'] + (manual['r4_10'] * 7) + (manual['bottom'] * (manual['winners_count'] - 10))
-            return {
-                "collection": collection,
-                "commission_amt": collection - pool,
-                "comm_pct": round(((collection - pool) / collection) * 100, 1) if collection > 0 else 0,
-                "pool": pool,
-                "winners": manual['winners_count'],
-                "1st": manual['r1'],
-                "2nd": manual['r2'],
-                "3rd": manual['r3'],
-                "4-10": manual['r4_10'],
-                "bottom": manual['bottom'],
-                "bottom_range": f"11-{manual['winners_count']}"
-            }
-
-    # Fetch dynamic settings from DB with defaults
-    comm_val = float(custom_comm) if custom_comm is not None else float(db.db_get_setting('PRIZE_COMMISSION', 10))
-    win_pct = float(db.db_get_setting('PRIZE_WINNERS_PCT', 70))
-    r1_pct = float(db.db_get_setting('PRIZE_R1_PCT', 35))
-    r2_pct = float(db.db_get_setting('PRIZE_R2_PCT', 20))
-    r3_pct = float(db.db_get_setting('PRIZE_R3_PCT', 12))
-
-    # Platform commission logic
-    commission_multiplier = (100 - comm_val) / 100
-    collection = fee * slots
-    pool = int(collection * commission_multiplier)
-    winners_count = int(slots * (win_pct / 100)) # Custom % winners
-
-    # Step 1: Guarantee every winner gets at least their entry fee back
-    total_base_cost = winners_count * fee
-    
-    # Safety check: if pool is too small for winner %, reduce winner count
-    if total_base_cost > pool:
-        winners_count = pool // fee
-        total_base_cost = winners_count * fee
-
-    # Step 2: Calculate Surplus (extra money above the entry fee refunds)
-    surplus = pool - total_base_cost
-    
-    top3_total_pct = r1_pct + r2_pct + r3_pct
-    remaining_pct = max(0, 100 - top3_total_pct)
-
-    prizes = {
-        "1st": fee + int(surplus * (r1_pct / 100)),
-        "2nd": fee + int(surplus * (r2_pct / 100)),
-        "3rd": fee + int(surplus * (r3_pct / 100)),
-        "4-10": fee + int((surplus * (remaining_pct / 100)) / 7)
-    }
-    return {
-        "collection": collection, "commission_amt": collection - pool, "comm_pct": comm_val,
-        "pool": pool, "winners": winners_count, 
-        "1st": prizes["1st"], "2nd": prizes["2nd"], "3rd": prizes["3rd"],
-        "4-10": prizes["4-10"], "bottom": fee, "bottom_range": f"11-{winners_count}"
-    }
-
-def prize_breakdown_render(match_id, fee, slots):
-    breakdown = get_prize_breakdown(fee, slots, match_id=match_id)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}"))
-    
-    text = (
-        f"🏆 *PRIZE BREAKUP (₹{fee} Contest)*\n"
-        f"👥 Total Slots: {slots} | 💰 Pool: ₹{breakdown['pool']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🥇 *Rank 1:* ₹{breakdown['1st']}\n"
-        f"🥈 *Rank 2:* ₹{breakdown['2nd']}\n"
-        f"🥉 *Rank 3:* ₹{breakdown['3rd']}\n"
-        f"🏅 *Rank 4-10:* ₹{breakdown['4-10']} each\n"
-        f"🎖 *Rank {breakdown['bottom_range']}:* ₹{breakdown['bottom']} (Refund)\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✨ *Total Winners:* {breakdown['winners']} (70% of slots)\n"
-        f"⚠️ _Note: Prize pool calculation slots full hone par based hai._"
-    )
-    return markup, text
-
-def match_dashboard_render(match_id, info, stats, user_summary, time_left, contest_configs=None, entry_fee=100):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    deadline = info['deadline']
-    today = datetime.now().date()
-    tomorrow = today + timedelta(days=1)
-    
-    if deadline.date() == today: day_tag = "Today 📅"
-    elif deadline.date() == tomorrow: day_tag = "Tomorrow 🗓"
-    else: day_tag = deadline.strftime('%d %b')
-
-    deadline_time = deadline.strftime('%I:%M %p')
-    
-    avail_spots = stats['max_slots'] - stats['joined']
-    
-    live_link = info.get('live_link')
-    if live_link:
-        markup.add(types.InlineKeyboardButton("📺 WATCH MATCH LIVE", url=live_link))
-    live_text = "📺 Match is LIVE! Niche button se dekhein.\n" if live_link else ""
-
-    if contest_configs:
-        for cfg in contest_configs:
-            fee = cfg['entry_fee']
-            
-            # Custom labeling based on entry level
-            if fee >= 100: label = f"🥇 Mega ₹{fee}"
-            elif fee >= 50: label = f"🥈 Medium ₹{fee}"
-            else: label = f"🥉 Small ₹{fee}"
-
-            markup.row(types.InlineKeyboardButton(label, callback_data=f"join_{match_id}_{fee}"),
-                       types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_{fee}"))
-    else:
-        markup.row(types.InlineKeyboardButton("🏅 Join Mega ₹100", callback_data=f"join_{match_id}_100"),
-                   types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_100"))
-    
-    if not user_summary['saved']:
-        markup.add(types.InlineKeyboardButton("🏏 PEHLE TEAM BANAO", callback_data=f"team_slots_{match_id}_1"))
-    else:
-        markup.add(types.InlineKeyboardButton("⚾ MY TEAMS", callback_data=f"team_slots_{match_id}_1"))
-
-    markup.add(
-        types.InlineKeyboardButton("📊 Leaderboard", callback_data=f"app_match_{match_id}"),
-        types.InlineKeyboardButton("🏏 Player Stats", callback_data=f"show_player_stats_{match_id}")
-    )
-    markup.add(types.InlineKeyboardButton("🔙 Match List", callback_data="contest_list"))
-
-    text = f"""
-🏏 *{info['name']}*
-📅 {day_tag} • Deadline: {deadline_time}
-⏰ Time Left: {time_left}
-━━━━━━━━━━━━━━━━━━━━
-💰 *Prize Pool: ₹{stats['prize_pool']}*
-{live_text}
-🎯 Entry: ₹{entry_fee}
-
-👥 {stats['joined']}/{stats['max_slots']} spots filled
-✅ {avail_spots} spots available
-━━━━━━━━━━━━━━━━━━━━
-👉 *Next: Team banao aur contest join karo!*"""
-    return markup, text
-
-def player_stats_render(match_id, match_name, stats, point_system):
-    res = f"📊 *PLAYER LIVE STATS: {match_name}*\n━━━━━━━━━━━━━━━━━━━━\n"
-    if not stats:
-        res += "_No stats recorded yet. Points update as soon as events occur._"
-    else:
-        for p in stats:
-            pts = (p['runs'] * point_system.get('run', 1) + 
-                   p['fours'] * point_system.get('four', 4) + 
-                   p['sixes'] * point_system.get('six', 6) + 
-                   p['wickets'] * point_system.get('wicket', 25))
-            res += f"👤 *{p['player_name']}*\n"
-            res += f"└ {p['runs']} runs | {p['fours']}x4 | {p['sixes']}x6 | {p['wickets']} wkts\n"
-            res += f"⭐ *Points:* `{int(pts)}` \n\n"
-            
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🔄 Refresh Score", callback_data=f"show_player_stats_{match_id}"),
-        types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}")
-    )
-    return markup, res
-
-def contest_selection_render(match_id, match_name):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🏅 Mega Contest (₹100) - 💎 High Prize", callback_data=f"sel_team_{match_id}_100"),
-        types.InlineKeyboardButton("🥈 Mid Contest (₹50) - 🔥 Low Comp", callback_data=f"sel_team_{match_id}_50"),
-        types.InlineKeyboardButton("🥉 Small Contest (₹20) - 🔰 Beginner", callback_data=f"sel_team_{match_id}_20"),
-        types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}")
-    )
-    text = f"🏆 *{match_name}* - Contest Selection\n\nChoose an entry level to compete. Each contest has different prize pools and competition levels."
-    return markup, text
-
-def team_points_breakdown_render(match_id, team_num, team_data, player_stats_map):
-    res = f"📊 *TEAM PERFORMANCE (T{team_num})*\n━━━━━━━━━━━━━━━━━━━━\n"
-    total = 0
-    for role in ['bat', 'wk', 'ar', 'bowl', 'sub']:
-        p_list = team_data.get(role, [])
-        if not p_list: continue
-        role_label = "IMPACT/SUB" if role == 'sub' else role.upper()
-        res += f"\n*{role_label}*\n"
-        for p in p_list:
-            stats = player_stats_map.get(p, {'runs': 0, 'fours': 0, 'sixes': 0, 'wickets': 0})
-            raw_pts = (stats['runs'] * 1 + stats['fours'] * 4 + stats['sixes'] * 6 + stats['wickets'] * 25)
-            
-            mult = 1.0
-            tag = ""
-            if p == team_data.get('captain'): mult, tag = 2.0, "(C)"
-            elif p == team_data.get('vice_captain'): mult, tag = 1.5, "(VC)"
-            
-            p_final = int(raw_pts * mult)
-            total += p_final
-            res += f"👤 {p} {tag}\n"
-            res += f"└ {stats['runs']} R | {stats['wickets']} W | `{p_final} pts`\n"
-            
-    res += f"━━━━━━━━━━━━━━━━━━━━\n⭐ *Total Points: {total}*"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back to Team", callback_data=f"view_team_{match_id}_{team_num}"))
-    return markup, res
-
-def team_slot_picker_render(user_id, match_id, fee, db_helper):
-    markup = types.InlineKeyboardMarkup(row_width=4)
-    res = f"⚾ *JOIN CONTEST (₹{fee})*\n━━━━━━━━━━━━━━━━━━━━\n"
-    res += "Select a team slot to join with:\n\n"
-    
-    buttons = []
-    for i in range(1, 11): # Showing first 10 slots
-        status = db_helper(user_id, match_id, i)
-        if status == "paid":
-            icon, cb = "✅", f"already_joined"
-        elif status == "unpaid":
-            icon, cb = "❌", f"final_join_{match_id}_{i}_{fee}"
-        else:
-            icon, cb = "⚪", f"nav_bat_{match_id}_{i}"
-        
-        buttons.append(types.InlineKeyboardButton(f"T{i}{icon}", callback_data=cb))
-        
-    markup.add(*buttons)
-    markup.add(types.InlineKeyboardButton("🔙 Back to Selection", callback_data=f"choose_contest_{match_id}"))
-    
-    res += "✅ Paid & Ready\n❌ Not Paid (Select to Join)\n⚪ Empty (Select to Create)"
-    return markup, res
+def db_set_live_link(match_id, link):
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET live_link = %s WHERE match_id = %s", (link, match_id))
+    return True
