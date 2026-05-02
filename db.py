@@ -14,6 +14,9 @@ load_dotenv()
 # Render provides the database URL in an environment variable
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Simple In-memory cache for settings to improve speed
+_settings_cache = {}
+
 @contextmanager
 def get_db():
     if not DATABASE_URL:
@@ -166,12 +169,19 @@ def db_set_setting(key, value):
             INSERT INTO SETTINGS (key, value) VALUES (%s, %s)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, (key, str(value)))
+    # Invalidate cache
+    if key in _settings_cache:
+        del _settings_cache[key]
 
 def db_get_setting(key, default=None):
+    if key in _settings_cache:
+        return _settings_cache[key]
     with get_db() as c:
         c.execute("SELECT value FROM SETTINGS WHERE key=%s", (key,))
         row = c.fetchone()
-        return row['value'] if row else default
+        val = row['value'] if row else default
+        _settings_cache[key] = val
+        return val
 
 def db_set_contest_config(mid, fee, slots):
     with get_db() as c:
