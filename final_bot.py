@@ -495,11 +495,12 @@ def callback_team_slots(call):
     bot.answer_callback_query(call.id)
 
     # Robust parsing for match_id
-    parts = call.data.split("_")
+    parts = call.data.split("_") # team_slots_{mid}_{page}
     if len(parts) < 3: return
     
-    match_id = parts[2]
-    page = int(parts[3]) if len(parts) > 3 else 1
+    # Handling potential underscores in match_id
+    page = int(parts[-1]) if parts[-1].isdigit() else 1
+    match_id = "_".join(parts[2:-1]) if parts[-1].isdigit() else "_".join(parts[2:])
     uid = str(call.from_user.id)
 
     # ⚡ Optimization: Fetch all teams for this user and match in one single query
@@ -744,7 +745,9 @@ def callback_final_confirm_save(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_team_"))
 def callback_view_team(call):
     parts = call.data.split("_")
-    match_id, team_num = parts[2], int(parts[3])
+    # View Team: view_team_{mid}_{tnum}
+    team_num = int(parts[-1])
+    match_id = "_".join(parts[2:-1])
     uid = str(call.from_user.id)
     
     team = db_get_team(uid, match_id, team_num)
@@ -782,7 +785,9 @@ def callback_view_team(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pts_break_"))
 def callback_points_breakdown(call):
     parts = call.data.split("_")
-    match_id, team_num = parts[2], int(parts[3])
+    # Points Break: pts_break_{mid}_{tnum}
+    team_num = int(parts[-1])
+    match_id = "_".join(parts[2:-1])
     uid = str(call.from_user.id)
     
     team = db_get_team(uid, match_id, team_num)
@@ -930,8 +935,8 @@ def callback_delete_team_confirm(call):
 # CONTEST
 # ===================================================
 
-@bot.message_handler(commands=['battles', 'contest'])
-@bot.message_handler(func=lambda m: m.text and "BATTLES" in m.text)
+@bot.message_handler(commands=['battles', 'contest', 'battle'])
+@bot.message_handler(func=lambda m: m.text and any(x in m.text.upper() for x in ["BATTLES", "CONTEST", "BATTLE"]))
 def cmd_contest(msg):
     uid = str(msg.from_user.id)
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -971,7 +976,9 @@ def cmd_contest(msg):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("join_"))
 def callback_join_match(call):
     parts = call.data.split("_")
-    match_id, fee = parts[1], int(parts[2])
+    # join_{mid}_{fee}
+    fee = int(parts[-1])
+    match_id = "_".join(parts[1:-1])
     uid = str(call.from_user.id)
     
     if is_match_locked(match_id):
@@ -1009,12 +1016,16 @@ def callback_join_match(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_join_"))
 def callback_confirm_join(call):
     parts = call.data.split("_")
-    match_id, team_num, fee = parts[2], parts[3], int(parts[4])
+    # confirm_join_{mid}_{tnum}_{fee}
+    fee = int(parts[-1])
+    team_num = parts[-2]
+    match_id = "_".join(parts[2:-2])
     callback_pay_now(call) # Use the existing payment flow logic
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_match_"))
 def callback_show_match(call):
-    mid = call.data.split("_")[2]
+    # show_match_{mid}
+    mid = "_".join(call.data.split("_")[2:])
     uid = str(call.from_user.id)
     default_fee = 100
     
@@ -1058,7 +1069,9 @@ def process_manual_prizes_input(msg):
 def callback_prize_breakup(call):
     bot.answer_callback_query(call.id) # Immediate feedback to remove loading state
     parts = call.data.split("_")
-    match_id, fee = parts[1], int(parts[2])
+    # breakup_{mid}_{fee}
+    fee = int(parts[-1])
+    match_id = "_".join(parts[1:-1])
     
     # Get current contest config to know max slots
     config = db.db_get_contest_config(match_id, fee)
