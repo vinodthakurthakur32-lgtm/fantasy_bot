@@ -2258,6 +2258,26 @@ def cmd_audit_match(msg):
     report = ui.audit_report_render(mid, MATCHES.get(mid, {}).get('name', mid), audit_data)
     bot.send_message(msg.chat.id, report, parse_mode='Markdown')
 
+def process_bulk_scoring(msg, match_id):
+    if not is_admin(msg.from_user.id): return
+    try:
+        lines = msg.text.strip().split('\n')
+        success_count = 0
+        for line in lines:
+            if "|" not in line: continue
+            parts = [p.strip() for p in line.split("|")]
+            p_name, runs, wkts = parts[0], int(parts[1]), int(parts[2])
+            
+            # Set absolute values in DB
+            db.db_set_player_stats_absolute(match_id, p_name, runs=runs, wickets=wkts)
+            success_count += 1
+        
+        # After updating stats, run the master re-sync for all teams
+        scoring.recalculate_match_points(match_id)
+        bot.reply_to(msg, f"✅ Bulk update complete! {success_count} players updated and all team points re-synced.")
+    except Exception as e:
+        bot.reply_to(msg, f"❌ Error in bulk format: {e}\nFormat: `Player | Runs | Wickets`")
+
 @bot.message_handler(commands=['rollback_match'])
 def cmd_rollback_match(msg):
     """⚠️ DANGER: Reverses all prizes for a match and makes it active again"""
