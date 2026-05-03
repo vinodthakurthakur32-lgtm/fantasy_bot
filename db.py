@@ -184,12 +184,12 @@ def db_get_setting(key, default=None):
         _settings_cache[key] = val
         return val
 
-def db_set_contest_config(mid, fee, slots):
+def db_set_contest_config(mid, fee, slots, c_type='J'):
     with get_db() as c:
         c.execute("""
-            INSERT INTO CONTEST_CONFIG (match_id, entry_fee, max_slots) VALUES (%s, %s, %s)
-            ON CONFLICT (match_id, entry_fee) DO UPDATE SET max_slots = EXCLUDED.max_slots
-        """, (mid, fee, slots))
+            INSERT INTO CONTEST_CONFIG (match_id, entry_fee, max_slots, contest_type) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (match_id, entry_fee) DO UPDATE SET max_slots = EXCLUDED.max_slots, contest_type = EXCLUDED.contest_type
+        """, (mid, fee, slots, c_type))
 
 def db_get_contest_config(mid, fee):
     with get_db() as c:
@@ -280,7 +280,8 @@ def run_migrations():
                 ("manual_lock", "INTEGER DEFAULT 0"),
                 ("live_link", "TEXT")
             ],
-            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'"), ("designation", "TEXT DEFAULT ''")]
+            "PLAYERS": [("team", "TEXT DEFAULT 'N/A'"), ("designation", "TEXT DEFAULT ''")],
+            "CONTEST_CONFIG": [("contest_type", "VARCHAR(50) DEFAULT 'J'")]
         }
         for table, cols in migrations.items():
             c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table.lower(),))
@@ -460,28 +461,41 @@ def get_admin_stats():
 def db_get_match_financials(match_id):
     """Calculates total collection and stats based on actual paid entries in Ledger"""
     with get_db() as c:
-        # Find all DEBIT entries in Ledger related to this match join
-        # reference_id format is 'DEBIT_MATCH_{match_id}_{team_num}_{timestamp}'
+        # Group actual participation from Ledger by Entry Fee to avoid "Mixing"
         search_pattern = f"DEBIT_MATCH_{match_id}_%"
         c.execute("""
-            SELECT ABS(SUM(amount)) as total_collection, COUNT(*) as total_entries 
+            SELECT ABS(amount) as fee, SUM(ABS(amount)) as collection, COUNT(*) as entries
             FROM LEDGER 
             WHERE type='DEBIT' AND reference_id LIKE %s
+            GROUP BY ABS(amount)
         """, (search_pattern,))
-        row = c.fetchone()
+        ledger_stats = c.fetchall()
         
-        # Get all distinct entry fees joined for this match to show prize breakdowns
-        c.execute("""
-            SELECT DISTINCT entry_fee, max_slots 
-            FROM CONTEST_CONFIG 
-            WHERE match_id=%s
-        """, (match_id,))
-        configs = c.fetchall()
+        # Fetch configs to match slots information
+        c.execute("SELECT entry_fee, max_slots, contest_type FROM CONTEST_CONFIG WHERE match_id=%s", (match_id,))
+        configs = {float(cfg['entry_fee']): (cfg['max_slots'], cfg.get('contest_type', 'J')) for cfg in c.fetchall()}
         
+        contests = []
+        total_col = 0
+        total_ent = 0
+        for row in ledger_stats:
+            f = float(row['fee'])
+            slots_info = configs.get(f, (0, 'J'))
+            slots, c_type = slots_info
+            contests.append({
+                "fee": f,
+                "collection": float(row['collection']),
+                "entries": row['entries'],
+                "max_slots": slots,
+                "type": c_type
+            })
+            total_col += float(row['collection'])
+            total_ent += row['entries']
+            
         return {
-            "collection": float(row['total_collection']) if row and row['total_collection'] else 0,
-            "entries": row['total_entries'] if row else 0,
-            "configs": configs
+            "total_collection": total_col,
+            "total_entries": total_ent,
+            "contests": contests
         }
 
 def get_contest_stats(match_id, entry_fee=100):
@@ -763,3 +777,82 @@ def db_get_team_joined_contests(user_id, match_id, team_num):
         c.execute("SELECT ABS(amount) as fee FROM LEDGER WHERE user_id=%s AND reference_id LIKE %s", (str(user_id), search_pattern))
         rows = c.fetchall()
         return [int(r['fee']) for r in rows]
+
+def db_get_all_user_data(user_id):
+    """Fetches all available data for a specific user from various tables."""
+    user_data = {}
+    with get_db() as c:
+        # 1. User Profile
+        c.execute("SELECT * FROM USERS WHERE user_id=%s", (user_id,))
+        user_data['profile'] = c.fetchone()
+
+        # 2. Wallet Balance
+        c.execute("SELECT SUM(amount) as balance FROM LEDGER WHERE user_id=%s", (user_id,))
+        user_data['wallet_balance'] = float(c.fetchone()['balance']) if c.fetchone() and c.fetchone()['balance'] else 0.0
+
+        # 3. Transaction History (Ledger)
+        c.execute("SELECT * FROM LEDGER WHERE user_id=%s ORDER BY timestamp DESC", (user_id,))
+        user_data['ledger_history'] = c.fetchall()
+
+        # 4. Teams
+        c.execute("SELECT * FROM TEAMS WHERE user_id=%s ORDER BY match_id, team_num", (user_id,))
+        user_data['teams'] = c.fetchall()
+
+        # 5. Payment Intents
+        c.execute("SELECT * FROM PAYMENT_INTENTS WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+        user_data['payment_intents'] = c.fetchall()
+
+        # 6. Payment Records (Screenshots/UTR)
+        c.execute("SELECT * FROM PAYMENTS WHERE user_id=%s ORDER BY timestamp DESC", (user_id,))
+        user_data['payments'] = c.fetchall()
+
+        # 7. Withdrawal Requests
+        c.execute("SELECT * FROM WITHDRAWALS WHERE user_id=%s ORDER BY timestamp DESC", (user_id,))
+        user_data['withdrawals'] = c.fetchall()
+
+        # 8. Match Results (History)
+        c.execute("SELECT * FROM USER_RESULTS WHERE user_id=%s ORDER BY timestamp DESC", (user_id,))
+        user_data['match_results'] = c.fetchall()
+
+        # 9. Support Tickets
+        c.execute("SELECT * FROM SUPPORT_TICKETS WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+        user_data['support_tickets'] = c.fetchall()
+
+    return user_data
+
+def db_get_match_audit_data(match_id):
+    """Audit ke liye match se judi saari financial aur team activity nikalta hai"""
+    with get_db() as c:
+        # 1. Total Debits (Users ne kitna pay kiya)
+        search_debit = f"DEBIT_MATCH_{match_id}_%"
+        c.execute("SELECT ABS(SUM(amount)) as total_in, COUNT(*) as entry_count FROM LEDGER WHERE reference_id LIKE %s AND type='DEBIT'", (search_debit,))
+        debit_stats = c.fetchone()
+
+        # 2. Total Credits (Bot ne kitna prize baanta)
+        search_credit = f"PRIZE_{match_id}_%"
+        c.execute("SELECT SUM(amount) as total_out, COUNT(*) as winner_count FROM LEDGER WHERE reference_id LIKE %s AND type='CREDIT'", (search_credit,))
+        credit_stats = c.fetchone()
+
+        # 3. Discrepancy check: Teams marked as paid vs Ledger entries
+        c.execute("SELECT COUNT(*) as paid_teams FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
+        paid_teams_count = c.fetchone()['paid_teams']
+
+        return {
+            "in": float(debit_stats['total_in'] or 0),
+            "entries": debit_stats['entry_count'] or 0,
+            "out": float(credit_stats['total_out'] or 0),
+            "winners": credit_stats['winner_count'] or 0,
+            "db_paid_teams": paid_teams_count
+        }
+
+def db_get_match_prizes(match_id):
+    """Ek match ke saare baante huye prizes ki list nikalta hai reversal ke liye"""
+    with get_db() as c:
+        search_pattern = f"PRIZE_{match_id}_%"
+        c.execute("SELECT user_id, amount, reference_id FROM LEDGER WHERE reference_id LIKE %s AND type='CREDIT'", (search_pattern,))
+        return c.fetchall()
+
+def db_reset_match_status(match_id):
+    """Match ko dubara active karta hai taaki points/result phir se set ho sakein"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 0 WHERE match_id = %s", (match_id,))
