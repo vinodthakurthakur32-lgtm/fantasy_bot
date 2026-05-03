@@ -788,7 +788,8 @@ def db_get_all_user_data(user_id):
 
         # 2. Wallet Balance
         c.execute("SELECT SUM(amount) as balance FROM LEDGER WHERE user_id=%s", (user_id,))
-        user_data['wallet_balance'] = float(c.fetchone()['balance']) if c.fetchone() and c.fetchone()['balance'] else 0.0
+        bal_row = c.fetchone()
+        user_data['wallet_balance'] = float(bal_row['balance']) if bal_row and bal_row['balance'] is not None else 0.0
 
         # 3. Transaction History (Ledger)
         c.execute("SELECT * FROM LEDGER WHERE user_id=%s ORDER BY timestamp DESC", (user_id,))
@@ -856,3 +857,15 @@ def db_reset_match_status(match_id):
     """Match ko dubara active karta hai taaki points/result phir se set ho sakein"""
     with get_db() as c:
         c.execute("UPDATE MATCHES_LIST SET points_calculated = 0 WHERE match_id = %s", (match_id,))
+
+def db_get_user_results(user_id):
+    """User ke purane matches ke results nikalta hai join karke"""
+    with get_db() as c:
+        c.execute("""
+            SELECT r.*, m.name as match_name 
+            FROM USER_RESULTS r
+            LEFT JOIN MATCHES_LIST m ON r.match_id = m.match_id
+            WHERE r.user_id = %s 
+            ORDER BY r.timestamp DESC
+        """, (str(user_id),))
+        return c.fetchall()
