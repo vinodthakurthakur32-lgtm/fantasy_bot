@@ -2260,26 +2260,41 @@ def cmd_audit_match(msg):
 
 def process_bulk_scoring(msg, match_id):
     if not is_admin(msg.from_user.id): return
-    try:
-        lines = msg.text.strip().split('\n')
-        success_count = 0
-        for line in lines:
-            if "|" not in line: continue
-            parts = [p.strip() for p in line.split("|")]
-            p_name, runs, wkts = parts[0], int(parts[1]), int(parts[2])
-            # Strip team tags like (RCB) if admin includes them in bulk
-            p_name = parts[0].split(' (')[0].strip()
-            runs, wkts = int(parts[1]), int(parts[2])
+    
+    bot.reply_to(msg, "⏳ <b>Processing Bulk Update...</b>\nRecalculating all team points in background.", parse_mode='HTML')
+
+    def run_bulk():
+        try:
+            lines = msg.text.strip().split('\n')
+            success_count = 0
+            skipped_players = []
+            for line in lines:
+                if "|" not in line: continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 3: continue
+                
+                p_name = parts[0].split(' (')[0].strip()
+                runs, wkts = int(parts[1]), int(parts[2])
+                
+                # Set absolute values in DB (with clean bonus reset)
+                if db.db_set_player_stats_absolute(match_id, p_name, runs, wickets):
+                    success_count += 1
+                else:
+                    skipped_players.append(p_name)
             
-            # Set absolute values in DB
-            db.db_set_player_stats_absolute(match_id, p_name, runs=runs, wickets=wkts)
-            success_count += 1
-        
-        # After updating stats, run the master re-sync for all teams
-        scoring.recalculate_match_points(match_id)
-        bot.reply_to(msg, f"✅ Bulk update complete! {success_count} players updated and all team points re-synced.")
-    except Exception as e:
-        bot.reply_to(msg, f"❌ Error in bulk format: {e}\nFormat: `Player | Runs | Wickets`")
+            # Master Re-sync
+            scoring.recalculate_match_points(match_id)
+            
+            resp = f"✅ <b>Bulk Update Success!</b>\n\n• Players Updated: <code>{success_count}</code>\n• All team points re-synced."
+            if skipped_players:
+                resp += f"\n\n⚠️ <b>Skipped (Not in Squad):</b>\n<code>{', '.join(skipped_players)}</code>"
+            
+            bot.send_message(msg.chat.id, resp, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"Bulk Scoring Error: {e}")
+            bot.send_message(msg.chat.id, f"❌ <b>Bulk Update Failed:</b> {html.escape(str(e))}", parse_mode='HTML')
+
+    threading.Thread(target=run_bulk).start()
 
 @bot.message_handler(commands=['rollback_match'])
 def cmd_rollback_match(msg):
