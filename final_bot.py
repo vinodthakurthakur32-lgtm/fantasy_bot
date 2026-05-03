@@ -1128,12 +1128,11 @@ def cmd_set_contest_size(msg):
     if not is_admin(msg.from_user.id): return
     help_txt = (
         "📏 *ADD/UPDATE CONTEST*\n\n"
-        "Format: `match_id | entry_fee | max_slots`\n\n"
+        "Format: `match_id | entry_fee | max_slots | Type (J/S)`\n\n"
         "💡 *Note:* \n"
-        "• ₹100+ = 🥇 Mega\n"
-        "• ₹50-99 = 🥈 Medium\n"
-        "• Under ₹50 = 🥉 Small\n\n"
-        "Example: `demo_m1 | 100 | 50`"
+        "• `J` = Jackpot (25% Winners)\n"
+        "• `S` = Team Saver (75% Winners)\n\n"
+        "Example: `m1 | 50 | 100 | J`"
     )
     sent = bot.send_message(msg.chat.id, help_txt, parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_contest_size)
@@ -1158,10 +1157,11 @@ def process_contest_size(msg):
     try:
         parts = [p.strip() for p in msg.text.split("|")]
         mid, fee, slots = parts[0], int(parts[1]), int(parts[2])
-        db.db_set_contest_config(mid, fee, slots)
-        bot.reply_to(msg, f"✅ *Battle Configured!*\nMatch: `{mid}`\nFee: ₹{fee}\nMax Slots: {slots}\n\nAb users ko 70% winners wala breakup dikhega.")
-    except Exception as e:
-        bot.reply_to(msg, "❌ Error! Use format: `mid | fee | slots`")
+        c_type = parts[3].upper() if len(parts) > 3 else ('J' if fee >= 30 else 'S')
+        db.db_set_contest_config(mid, fee, slots, c_type=c_type)
+        bot.reply_to(msg, f"✅ *Battle Configured!*\nMatch: `{mid}`\nFee: ₹{fee}\nType: {'JACKPOT' if c_type=='J' else 'SAVER'}\nMax Slots: {slots}")
+    except Exception:
+        bot.reply_to(msg, "❌ Error! Use format: `mid | fee | slots | J/S`")
 
 @bot.message_handler(commands=['set_prize_config'])
 def cmd_set_prize_config(msg):
@@ -1530,7 +1530,21 @@ def callback_approve(call):
                 "status": "completed"
             }, "PAYMENTS")
             
-            bot.send_message(uid, f"🎉 *PAYMENT APPROVED!*\n₹{amount} credited to ledger.", parse_mode='Markdown')
+            if mid == "wallet":
+                bot.send_message(uid, f"🎉 *PAYMENT APPROVED!*\n\n₹{amount} aapke wallet balance mein add kar diye gaye hain. Ab aap kisi bhi contest mein join kar sakte hain.", parse_mode='Markdown')
+            else:
+                match_name = MATCHES.get(mid, {}).get('name', mid)
+                join_success_msg = (
+                    f"🎊 *CONTEST JOINED SUCCESSFULLY!*\n\n"
+                    f"🏟 Match: *{match_name}*\n"
+                    f"⚾ Team Slot: *T{tnum}*\n"
+                    f"💰 Entry Fee Paid: *₹{amount}*\n\n"
+                    "Aapki team battle mein enter ho chuki hai. Match start hone par leaderboard par points check karein! 👍"
+                )
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("📊 VIEW MY TEAM", callback_data=f"view_team_{mid}_{tnum}"))
+                bot.send_message(uid, join_success_msg, reply_markup=markup, parse_mode='Markdown')
+
             bot.edit_message_caption(caption=f"✅ APPROVED (₹{amount})", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reject_"))
@@ -1738,9 +1752,7 @@ def cmd_history(msg_or_call):
     else:
         text = "📜 *Last 10 Transactions*\n\n"
         for item in history:
-            sign = "✅ +" if item['type'] == 'CREDIT' else "❌ -"
-            date = item['timestamp'][5:16] # Format: 04-24 19:30
-            text += f"`{date}` | {sign}₹{abs(item['amount'])} | {item['reference_id'][:12]}...\n"
+            text += ui.transaction_item_render(item) + "\n"
     
     if is_cb: bot.answer_callback_query(msg_or_call.id)
     bot.send_message(msg.chat.id, text, parse_mode='Markdown')
@@ -1881,25 +1893,35 @@ def callback_withdrawal_admin(call):
 @bot.message_handler(commands=['stats'])
 @bot.message_handler(func=lambda m: m.text and "STATS" in m.text)
 def cmd_stats(msg):
+    """Comprehensive user stats across all matches"""
     uid = str(msg.from_user.id)
     user = db.db_get_user(uid)
     
-    # Dynamically find the first match the user has a team in
-    team = None
-    for mid in MATCHES.keys():
-        team = db.db_get_team_internal(uid, mid, 1)
-        if team: break
-    
     if not user:
-        bot.send_message(msg.chat.id, "❌ No account!")
-        return
+        return bot.send_message(msg.chat.id, "❌ Account nahi mila!")
+
+    balance = db.db_get_wallet_balance(uid)
+    with db.get_db() as conn:
+        conn.execute("SELECT COUNT(DISTINCT match_id) as m_cnt, SUM(points) as t_pts FROM TEAMS WHERE user_id=%s AND team_saved=1", (uid,))
+        overall = conn.fetchone()
+        
+        conn.execute("SELECT COUNT(*) as win_cnt FROM USER_RESULTS WHERE user_id=%s AND prize != '₹0'", (uid,))
+        wins = conn.fetchone()
+
+    text = (
+        f"📊 *USER DASHBOARD: {user['first_name']}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Wallet Balance: *₹{balance}*\n"
+        f"🏟 Matches Played: `{overall['m_cnt'] or 0}`\n"
+        f"🏆 Total Wins: `{wins['win_cnt'] or 0}`\n"
+        f"⭐ Lifetime Points: `{overall['t_pts'] or 0}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
     
-    points = team.get('points', 0) if team else 0
-    team_count = get_total_players(team) if team else 0
-    text = f"📊 *STATS*\n\n👤 {user['first_name']}\n⭐ Points: {points}\n🎯 Team: {team_count}/11"
-    
-    if team_count == 0:
-        text += "\n\n🚀 *Abhi tak koi team nahi hai!* \nJeetne ke liye apni pehli team banayein: /myteam"
+    if (overall['m_cnt'] or 0) == 0:
+        text += "🚀 *Abhi tak koi team nahi hai!*\nApni pehli team banayein aur jeetna shuru karein!"
+    else:
+        text += "👉 Purane results dekhne ke liye *'My Results'* button dabayein."
 
     bot.send_message(msg.chat.id, text, parse_mode='Markdown')
 
@@ -1934,12 +1956,13 @@ def cmd_help(msg):
 ❓ <b>BOT FEATURES & COMMANDS</b>
 ━━━━━━━━━━━━━━━━━━━━
 ⚾ <b>Team Management:</b> /myteam - Team banayein aur edit karein.
-🏆 <b>Join Matches:</b> /contest - Available contests mein join karein.
+🏆 <b>Join Battles:</b> /contest - Jackpot aur Saver contests join karein.
 💰 <b>Wallet:</b> /wallet - Balance, Deposit, aur Withdrawal (/withdraw) manage karein.
 📊 <b>Live Rank:</b> /myrank - Live match ke waqt apna rank dekhein.
 📈 <b>User Stats:</b> /stats - Apni total performance dekhein.
 🎁 <b>Referrals:</b> /myreferrals - Apne referral bonus ki details dekhein.
 📜 <b>History:</b> /history - Apni transaction history dekhein.
+📜 <b>Results:</b> Match khatam hone par purane results dekhein.
 🏆 <b>Leaderboard:</b> /leaderboard - Top 10 users dekhein.
 ⚖️ <b>Rules:</b> /rules - Scoring system samjhein.
 🎫 <b>Support:</b> /support - Kisi bhi problem ke liye ticket banayein.
@@ -2140,6 +2163,100 @@ def process_handle_setting(msg):
             bot.reply_to(msg, "❌ Invalid Type! Use `SUPPORT`, `CHANNEL`, `PAYMENT_ID`, or `SUPPORT_ID`.")
     except:
         bot.reply_to(msg, "❌ Error! Format: `TYPE | HANDLE`")
+
+@bot.message_handler(commands=['get_user_data'])
+def cmd_get_user_data(msg):
+    if not is_admin(msg.from_user.id): return
+    sent = bot.send_message(msg.chat.id, "👤 *USER DATA DUMP*\n\nJis user ka data chahiye, uski User ID bhein:", parse_mode='Markdown')
+    bot.register_next_step_handler(sent, process_get_user_data_input)
+
+def process_get_user_data_input(msg):
+    if not is_admin(msg.from_user.id): return
+    target_uid = msg.text.strip()
+
+    try:
+        user_data = db.db_get_all_user_data(target_uid)
+        
+        if not user_data['profile']:
+            bot.reply_to(msg, f"❌ User ID `{target_uid}` nahi mila database mein.")
+            return
+
+        response_text = f"👤 *USER DATA FOR ID: {target_uid}*\n━━━━━━━━━━━━━━━━━━━━\n"
+        
+        # Profile
+        profile = user_data['profile']
+        response_text += f"<b>PROFILE:</b>\n"
+        response_text += f"  Name: {profile.get('first_name')} (@{profile.get('username')})\n"
+        response_text += f"  Joined: {profile.get('joined_date')}\n"
+        response_text += f"  Last Seen: {profile.get('last_seen')}\n"
+        response_text += f"  Referred By: {profile.get('referred_by', 'N/A')}\n"
+        response_text += f"  Flagged: {'Yes' if profile.get('is_flagged') else 'No'}\n"
+        response_text += f"  Wallet Balance: ₹{user_data['wallet_balance']}\n\n"
+
+        # Teams
+        if user_data['teams']:
+            response_text += "<b>TEAMS:</b>\n"
+            for team in user_data['teams']:
+                response_text += f"  - Match: {team['match_id']}, T{team['team_num']}, Pts: {team['points']}, Paid: {'Yes' if team['is_paid'] else 'No'}\n"
+        else: response_text += "<b>TEAMS:</b> No teams found.\n"
+        
+        # Transaction History (Ledger) - Last 5
+        response_text += "\n<b>LAST 5 TRANSACTIONS:</b>\n"
+        if user_data['ledger_history']:
+            for item in user_data['ledger_history'][:5]:
+                response_text += f"  - {ui.transaction_item_render(item)}\n"
+        else: response_text += "  No transactions.\n"
+
+        # Agar aur data chahiye toh yahan add kar sakte hain (Payments, Withdrawals, Results, Tickets)
+        # For now, keeping it concise.
+
+        bot.send_message(msg.chat.id, response_text, parse_mode='HTML')
+
+    except Exception as e:
+        logging.error(f"Error fetching user data: {e}")
+        bot.reply_to(msg, f"❌ Error fetching user data: {e}")
+
+@bot.message_handler(commands=['audit_match'])
+def cmd_audit_match(msg):
+    if not is_admin(msg.from_user.id): return
+    mid = msg.text.replace('/audit_match', '').strip()
+    if not mid: return bot.reply_to(msg, "Usage: `/audit_match m1`")
+    audit_data = db.db_get_match_audit_data(mid)
+    report = ui.audit_report_render(mid, MATCHES.get(mid, {}).get('name', mid), audit_data)
+    bot.send_message(msg.chat.id, report, parse_mode='Markdown')
+
+@bot.message_handler(commands=['rollback_match'])
+def cmd_rollback_match(msg):
+    """⚠️ DANGER: Reverses all prizes for a match and makes it active again"""
+    if not is_admin(msg.from_user.id): return
+    mid = msg.text.replace('/rollback_match', '').strip()
+    if not mid: return bot.reply_to(msg, "Usage: `/rollback_match m1`")
+    
+    prizes = db.db_get_match_prizes(mid)
+    if not prizes:
+        return bot.reply_to(msg, f"❌ Match `{mid}` mein koi prizes distribute nahi huye hain.")
+
+    bot.send_message(msg.chat.id, f"⏳ Rollback shuru ho raha hai for `{mid}`... {len(prizes)} entries process hongi.")
+    
+    revert_count = 0
+    for p in prizes:
+        uid, amt, orig_ref = p['user_id'], p['amount'], p['reference_id']
+        rev_ref = f"REVERT_{orig_ref}"
+        
+        # Insert a DEBIT entry to take the money back
+        with db.get_db() as conn:
+            conn.execute("SELECT id FROM LEDGER WHERE reference_id=%s", (rev_ref,))
+            if not conn.fetchone():
+                conn.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                             (uid, -amt, rev_ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                revert_count += 1
+
+    db.db_reset_match_status(mid)
+    if mid in MATCHES:
+        MATCHES[mid]['points_calculated'] = False
+        
+    bot.send_message(msg.chat.id, f"✅ *ROLLBACK COMPLETE!*\n\n• Total Reverted: `{revert_count}` users\n• Match `{mid}` is now ACTIVE again.\n\nAb aap `/up` se points theek karke phir se result declare kar sakte hain.")
+    logging.warning(f"🚨 ADMIN ACTION: Rollback performed for match {mid} by {msg.from_user.id}")
 
 @bot.message_handler(commands=['clear_database'])
 def cmd_clear_db(msg):
@@ -2628,112 +2745,50 @@ def cmd_download_db(msg):
 
 @bot.message_handler(commands=['setup_contests'])
 def cmd_setup_contests(msg):
-    """Ek hi match ke liye teeno (Mega, Med, Small) contests set karne ka wizard"""
-    """Match ke liye unlimited contests add karne ka loop wizard"""
+    """Match ke liye unlimited Jackpot/Saver contests add karne ka wizard"""
     if not is_admin(msg.from_user.id): return
-    sent = bot.send_message(msg.chat.id, "🎯 *CONTEST SETUP WIZARD*\n\nMatch ID bhein jiske liye contests set karne hain (e.g. `m1`):", parse_mode='Markdown')
-    sent = bot.send_message(msg.chat.id, "🎯 *FLEXIBLE CONTEST SETUP*\n\nMatch ID bhein (e.g. `m1`):", parse_mode='Markdown')
+    sent = bot.send_message(msg.chat.id, "🎯 *BATTLE SETUP WIZARD*\n\nMatch ID bhein (e.g. `m1`):", parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_setup_contests_start)
 
 def process_setup_contests_start(msg):
     mid = msg.text.strip()
     if mid not in MATCHES:
-        bot.reply_to(msg, f"❌ Match `{mid}` nahi mila! Match list check karein.")
+        bot.reply_to(msg, f"❌ Match `{mid}` nahi mila!")
         return
     uid = str(msg.from_user.id)
     ADMIN_MATCH_CONTEXT[uid] = mid
-    bot.send_message(msg.chat.id, f"✅ Match `{mid}` selected.\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots` (e.g. `100 | 50`)", parse_mode='Markdown')
-    bot.register_next_step_handler(msg, process_mega_setup)
-    bot.send_message(msg.chat.id, f"✅ Match `{mid}` selected.\n\nAb contest details bhein: `fee | slots` \nExample: `50 | 100` \n\nJab saare add ho jayein toh `done` likhein.", parse_mode='Markdown')
+    text = (f"✅ Match `{mid}` selected.\n\n"
+            "Ab contest details bhein: `fee | slots | Type` \n"
+            "Example: `50 | 100 | J` (Jackpot) or `20 | 200 | S` (Saver)\n\n"
+            "Jab saare add ho jayein toh `done` likhein.")
+    bot.send_message(msg.chat.id, text, parse_mode='Markdown')
     bot.register_next_step_handler(msg, process_flexible_contest_setup)
 
-def process_mega_setup(msg):
-    if not is_admin(msg.from_user.id): return # Admin check
-    uid = str(msg.from_user.id)
-    mid = ADMIN_MATCH_CONTEXT.get(uid)
 def process_flexible_contest_setup(msg):
     if msg.text.lower() == 'done':
-        bot.send_message(msg.chat.id, "✅ *All Contests Configured!* Match live hai.")
+        uid = str(msg.from_user.id)
+        ADMIN_MATCH_CONTEXT.pop(uid + "_wizard", None) # Clear wizard context
+        bot.send_message(msg.chat.id, "✅ *Contest Setup Finish!*")
         return
     
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_medium_setup)
-        return
-
-    try:
-        parts = [p.strip() for p in msg.text.split("|")]
-        fee, slots = int(parts[0]), int(parts[1])
-        comm = int(parts[2]) if len(parts) > 2 else None
-        
-        db.db_set_contest_config(mid, fee, slots)
-        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm, match_id=mid)
-        
-        txt = (f"✅ *MEGA Contest Set!*\n\n💰 Pool: ₹{bd['pool']} | ✨ Winners: {bd['winners']}\n"
-               f"🥇 R1: ₹{bd['1st']} | 🥈 R2: ₹{bd['2nd']}\n🥉 R3: ₹{bd['3rd']} | 🏅 R4-10: ₹{bd['4-10']}\n\n"
-               f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots | comm%`) ya `skip` likhein:")
-        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_medium_setup)
-    except Exception as e:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`) or `skip`.")
-        bot.register_next_step_handler(msg, process_mega_setup)
-
-def process_medium_setup(msg):
-    if not is_admin(msg.from_user.id): return
     uid = str(msg.from_user.id)
     mid = ADMIN_MATCH_CONTEXT.get(uid)
-
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "⏭️ Medium skipped. Ab **🥉 SMALL Contest** bhein (`fee | slots`):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_small_setup)
-        return
-
     try:
         parts = [p.strip() for p in msg.text.split("|")]
         fee, slots = int(parts[0]), int(parts[1])
-        comm = int(parts[2]) if len(parts) > 2 else None
-
-        db.db_set_contest_config(mid, fee, slots)
-        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm, match_id=mid)
-        
-        txt = (f"✅ *MEDIUM Contest Set!*\n\n💰 Pool: ₹{bd['pool']} | ✨ Winners: {bd['winners']}\n"
-               f"🥇 R1: ₹{bd['1st']} | 🥈 R2: ₹{bd['2nd']}\n🥉 R3: ₹{bd['3rd']} | 🏅 R4-10: ₹{bd['4-10']}\n\n"
-               f"Ab **🥉 SMALL Contest** details bhein (`fee | slots | comm%`) ya `skip` likhein:")
-        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_small_setup)
-    except Exception:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`) or `skip`.")
-        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_medium_setup)
-        bot.reply_to(msg, f"✅ Added: ₹{fee} ({slots} slots). Agla bhein ya `done` likhein.")
+        # Explicit type detection with automatic fallback
+        c_type = parts[2].upper() if len(parts) > 2 else ('J' if fee >= 30 else 'S')
+        if c_type not in ['J', 'S']:
+            bot.reply_to(msg, "❌ Invalid Type! Use 'J' for Jackpot or 'S' for Saver.")
+            bot.register_next_step_handler(msg, process_flexible_contest_setup)
+            return
+            
+        db.db_set_contest_config(mid, fee, slots, c_type=c_type)
+        type_name = "JACKPOT" if c_type == 'J' else "SAVER"
+        bot.reply_to(msg, f"✅ Added {type_name}: ₹{fee} ({slots} slots). Agla bhein ya `done` likhein.")
     except:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots`.")
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots | J/S`.")
     bot.register_next_step_handler(msg, process_flexible_contest_setup)
-
-def process_small_setup(msg):
-    if not is_admin(msg.from_user.id): return
-    uid = str(msg.from_user.id)
-    mid = ADMIN_MATCH_CONTEXT.get(uid)
-
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "✅ *Match Setup Complete!* Sabhi updates live hain.")
-        return
-
-    try:
-        parts = [p.strip() for p in msg.text.split("|")]
-        fee, slots = int(parts[0]), int(parts[1])
-        comm = int(parts[2]) if len(parts) > 2 else None
-        
-        db.db_set_contest_config(mid, fee, slots)
-        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm, match_id=mid)
-        
-        txt = (f"✅ *SMALL Contest Set!*\n\n💰 Pool: ₹{bd['pool']} | ✨ Winners: {bd['winners']}\n"
-               f"🥇 R1: ₹{bd['1st']} | 🥈 R2: ₹{bd['2nd']}\n🥉 R3: ₹{bd['3rd']} | 🏅 R4-10: ₹{bd['4-10']}\n\n"
-               f"🚀 *Match Setup Complete!* Match ab live hai.")
-        
-        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-    except Exception:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`) or `skip`.")
-        bot.register_next_step_handler_by_chat_id(msg.chat.id, process_small_setup)
 
 @bot.message_handler(commands=['export_data'])
 def cmd_export_data(msg):
@@ -2866,6 +2921,11 @@ def process_match_end(match_id):
         # Fetch all player live stats for this match
         player_live_scores_map = db.db_get_all_player_scores(match_id)
 
+        # 🛡️ Safety: Check if prizes were already distributed for this match
+        if MATCHES.get(match_id, {}).get('points_calculated') == 2:
+            bot.send_message(ADMIN_ID, "⚠️ Prizes for this match have already been distributed. Action blocked to prevent double-pay.")
+            return
+
         # Check if anyone actually joined the match
         participant_count = db.db_get_match_participant_count(match_id)
         if participant_count == 0:
@@ -2873,17 +2933,26 @@ def process_match_end(match_id):
             db.db_mark_points_calculated(match_id)
             return
         
-        if calculate_all_points(match_id, player_live_scores_map):
-            db.db_mark_points_calculated(match_id) # DB mein mark karein
+        if calculate_all_points(match_id, player_live_scores_map, is_final=True):
+            db.db_mark_prizes_distributed(match_id) # Set status to 2 (Prizes Distributed)
             
             # 🧹 Cleanup: Unpaid teams ko delete karo kyunki match khatam ho gaya hai
             db.db_cleanup_unpaid_teams(match_id)
             
-            MATCHES[match_id]['points_calculated'] = True # Memory cache mein update karein
-            bot.send_message(ADMIN_ID, f"✅ <b>Points Calculated for Match: {html.escape(MATCHES[match_id]['name'])}</b>", parse_mode='HTML')
+            # ⚡ Match ko turant memory se update karo taaki contest list se hat jaye
+            if match_id in MATCHES:
+                MATCHES[match_id]['points_calculated'] = 2
+            
+            bot.send_message(ADMIN_ID, f"✅ <b>Match Settled: {html.escape(MATCHES[match_id]['name'])}</b>\n\nAb ye match users ki history (My Results) mein dikhega aur Contest list se hat chuka hai.", parse_mode='HTML')
+            
+            # 🛡️ Run Automatic Audit with 5-second delay for safety
+            time.sleep(5)
+            audit_data = db.db_get_match_audit_data(match_id)
+            report = ui.audit_report_render(match_id, MATCHES[match_id]['name'], audit_data)
+            bot.send_message(ADMIN_ID, report, parse_mode='Markdown')
+            
             logging.info(f"✅ Points calculation completed for match: {match_id}")
         else:
-            # Error message ko admin ke liye verbose banaya
             err_msg = f"❌ <b>Settlement Failed:</b> {html.escape(str(match_id))}\nCheck logic in <code>calculate_all_points</code>."
             bot.send_message(ADMIN_ID, err_msg, parse_mode='HTML')
             logging.error(f"❌ Error in point calculation for match: {match_id}")
@@ -2921,12 +2990,13 @@ def send_reengagement_notifications():
 # POINTS CALCULATION SYSTEM
 # ===================================================
 
-def calculate_all_points(match_id, player_scores):
+def calculate_all_points(match_id, player_scores, is_final=False):
     """
     Calculates points for all teams in a given match.
     Args:
         match_id (str): The ID of the match.
         player_scores (dict): A dictionary of {'Player Name': total_points_from_stats}.
+        is_final (bool): If True, distributes prizes and saves history.
     """
     try:
         with db.get_db() as conn:
@@ -2937,7 +3007,32 @@ def calculate_all_points(match_id, player_scores):
                 JOIN LEDGER l ON l.reference_id LIKE 'DEBIT_MATCH_' || t.match_id || '_' || t.team_num || '_%%'
                 WHERE t.match_id = %s AND t.is_paid = 1
             """, (match_id,))
-            all_paid_teams = conn.fetchall()
+            all_paid_teams_raw = conn.fetchall()
+
+            # Get match-specific minimum or fallback to global
+            min_participants = int(db.db_get_setting(f'MIN_PARTICIPANTS_{match_id}', db.db_get_setting('MIN_CONTEST_PARTICIPANTS', 2)))
+
+            # Group by entry_fee
+            teams_by_fee = {}
+            for team_row in all_paid_teams_raw:
+                fee = abs(int(team_row['entry_fee']))
+                if fee not in teams_by_fee:
+                    teams_by_fee[fee] = []
+                teams_by_fee[fee].append(team_row)
+
+            contests_to_process_for_prizes = {}
+            
+            # Process cancellations first
+            for fee, contest_teams_list in teams_by_fee.items():
+                actual_participants = len(contest_teams_list) if contest_teams_list else 0
+
+                if actual_participants < min_participants:
+                    process_contest_cancellation_and_refund(match_id, fee, contest_teams_list)
+                else:
+                    contests_to_process_for_prizes[fee] = contest_teams_list
+            
+            # Flatten the list of teams that will actually be processed for prizes
+            all_paid_teams = [team for sublist in contests_to_process_for_prizes.values() for team in sublist]
             
             if not all_paid_teams:
                 logging.info(f"No paid teams to calculate for match {match_id}")
@@ -2961,9 +3056,13 @@ def calculate_all_points(match_id, player_scores):
                              (total_pts, uid, match_id, tnum))
                 row['points'] = total_pts 
 
+            # 🚨 Safety Check: Agar final settlement nahi hai, toh prizes mat baanto
+            if not is_final:
+                return True
+
             # 3. Group by Contest (Entry Fee) and Reward
-            # We find distinct entry fees joined for this match
-            entry_fees = set(abs(int(r['entry_fee'])) for r in all_paid_teams)
+            # Use only fees from contests that were not cancelled
+            entry_fees = contests_to_process_for_prizes.keys()
             
             for fee in entry_fees:
                 # Filter teams belonging to this contest tier
@@ -2974,56 +3073,85 @@ def calculate_all_points(match_id, player_scores):
                 actual_participants = len(contest_teams)
                 # Max slots are still used as a fallback or for custom breakdown logic
                 # but calculating breakdown based on actual joined players prevents loss.
-                bd = ui.get_prize_breakdown(fee, actual_participants, match_id=match_id)
+                conn.execute("SELECT contest_type FROM CONTEST_CONFIG WHERE match_id=%s AND entry_fee=%s", (match_id, fee))
+                cfg = conn.fetchone()
+                c_type = cfg.get('contest_type', 'J') if cfg else ('J' if fee >= 30 else 'S')
                 
-                for index, res in enumerate(contest_teams):
-                    rank = index + 1
-                    prize_amt = 0
-                    
-                    if rank == 1: prize_amt = bd.get('1st', 0)
-                    elif rank == 2: prize_amt = bd.get('2nd', 0)
-                    elif rank == 3: prize_amt = bd.get('3rd', 0)
-                    elif rank == 4: prize_amt = bd.get('4th', bd.get('4-10', bd.get('bottom', 0)))
-                    elif rank == 5: prize_amt = bd.get('5th', bd.get('4-10', bd.get('bottom', 0)))
-                    elif 6 <= rank <= 10: prize_amt = bd.get('6-10', bd.get('4-10', bd.get('bottom', 0)))
-                    elif rank > 10 and rank <= bd['winners']: prize_amt = bd['bottom']
-                    
-                    prize_text = f"₹{prize_amt}" if prize_amt > 0 else "₹0"
-                    
-                    # Credit Prize
-                    if prize_amt > 0:
-                        ref_id = f"PRIZE_{match_id}_{fee}_{rank}_{res['user_id']}_{res['team_num']}"
-                        process_payment_success(res['user_id'], prize_amt, ref_id, conn=conn)
-                        
-                        congrats_msg = (
-                            f"🎊 *CONGRATS!*\n\n"
-                            f"Match: `{MATCHES[match_id]['name']}`\n"
-                            f"Rank: *#{rank}* (Team {res['team_num']})\n"
-                            f"Points: *{res['points']}*\n"
-                            f"Prize: *{prize_text}* 💰\n\n"
-                            f"Balance aapke wallet mein add kar diya gaya hai!"
-                        )
-                        try: bot.send_message(res['user_id'], congrats_msg, parse_mode='Markdown')
-                        except: pass
-                    else:
-                        fail_msg = (
-                            f"📉 *Match Ended*\n\n"
-                            f"Match: `{MATCHES[match_id]['name']}`\n"
-                            f"Rank: *#{rank}* (Team {res['team_num']})\n"
-                            f"Points: *{res['points']}*\n\n"
-                            "Better luck next time!"
-                        )
-                        try: bot.send_message(res['user_id'], fail_msg, parse_mode='Markdown')
-                        except: pass
+                bd = ui.get_prize_breakdown(fee, actual_participants, match_id=match_id, contest_type=c_type)
+                type_name = "JACKPOT" if c_type == 'J' else "TEAM SAVER"
+                
+                def get_rank_prize(r, b_data):
+                    if r == 1: return b_data.get('1st', 0)
+                    if r == 2: return b_data.get('2nd', 0)
+                    if r == 3: return b_data.get('3rd', 0)
+                    if r == 4: return b_data.get('4th', b_data.get('4-10', 0))
+                    if r == 5: return b_data.get('5th', b_data.get('4-10', 0))
+                    if 6 <= r <= 10: return b_data.get('6-10', b_data.get('4-10', 0))
+                    if r <= b_data.get('winners', 0): return b_data.get('bottom', 0)
+                    return 0
 
-                    # Sheets Sync
-                    sheets.sync_wrapper({
-                        "contest_date": datetime.now().strftime('%Y-%m-%d'),
-                        "user_id": res['user_id'],
-                        "points": res['points'],
-                        "rank": rank,
-                        "prize": prize_text
-                    }, "RESULTS")
+                i = 0
+                while i < len(contest_teams):
+                    # 1. Group teams with same points (Tie)
+                    j = i
+                    while j < len(contest_teams) and contest_teams[j]['points'] == contest_teams[i]['points']:
+                        j += 1
+                    
+                    tied_group = contest_teams[i:j]
+                    num_tied = len(tied_group)
+                    start_rank = i + 1
+                    
+                    # 2. Calculate Total Prize for shared ranks
+                    sum_prize = 0
+                    for r in range(start_rank, start_rank + num_tied):
+                        sum_prize += get_rank_prize(r, bd)
+                    
+                    avg_prize = int(sum_prize / num_tied) if num_tied > 0 else 0
+                    prize_text = f"₹{avg_prize}"
+                    
+                    # 3. Distribute to everyone in this point group
+                    for res in tied_group:
+                        rank_display = f"#{start_rank}" + (" (Joint)" if num_tied > 1 else "")
+                        
+                        if avg_prize > 0:
+                            ref_id = f"PRIZE_{match_id}_{fee}_{start_rank}_{res['user_id']}_{res['team_num']}"
+                            process_payment_success(res['user_id'], avg_prize, ref_id, conn=conn)
+                            
+                            congrats_msg = (
+                                f"🎊 *CONGRATS! {type_name} WINNER* 🎊\n\n"
+                                f"🏆 *Match:* {MATCHES[match_id]['name']}\n"
+                                f"💰 *Prize:* `₹{avg_prize}`\n"
+                                f"📊 *Rank:* `{rank_display}` (T{res['team_num']})\n"
+                                f"⭐ *Points:* `{res['points']}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"Balance aapke wallet mein add kar diya gaya hai!"
+                            )
+                            conn.execute("INSERT INTO USER_RESULTS (user_id, match_id, team_num, points, rank, prize, timestamp) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                         (res['user_id'], match_id, res['team_num'], res['points'], start_rank, prize_text, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                            try: bot.send_message(res['user_id'], congrats_msg, parse_mode='Markdown')
+                            except: pass
+                        else:
+                            fail_msg = (
+                                f"📉 *Match Ended ({type_name})*\n\n"
+                                f"Match: `{MATCHES[match_id]['name']}`\n"
+                                f"Rank: `{rank_display}` (T{res['team_num']})\n"
+                                f"Points: *{res['points']}*\n\n"
+                                "Better luck next time!"
+                            )
+                            try: bot.send_message(res['user_id'], fail_msg, parse_mode='Markdown')
+                            except: pass
+
+                        # Sheets Sync
+                        sheets.sync_wrapper({
+                            "contest_date": datetime.now().strftime('%Y-%m-%d'),
+                            "user_id": res['user_id'],
+                            "points": res['points'],
+                            "rank": start_rank,
+                            "prize": prize_text
+                        }, "RESULTS")
+
+                    # Move pointer by number of tied players
+                    i = j
                 
         return True
     except Exception as e:
@@ -3062,15 +3190,28 @@ def process_match_input(msg):
         ADMIN_MATCH_CONTEXT[uid] = mid # Remember match context
         ADMIN_MATCH_CONTEXT[uid + "_wizard"] = True # Start setup wizard
 
-        bot.reply_to(msg, (
-            f"✅ *Match Added: {name}*\n\n"
-            "Ab is match ke liye *Players* bhein.\n"
-            "Format: `Name | Role | Desig | Team`\n"
-            "Example: `Virat Kohli | bat | c | RCB`"
-        ), parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_player_addition)
+        bot.reply_to(msg, f"✅ *Match Added: {name}*\n\nAb is match ke liye **Minimum Participants** bhein (e.g., `2` ya `5`):\n(Agar isse kam log huye toh contest auto-cancel ho jayega)", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, process_min_participants_input)
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}\nFormat check karein: `YYYY-MM-DD HH:MM`")
+
+def process_min_participants_input(msg):
+    uid = str(msg.from_user.id)
+    mid = ADMIN_MATCH_CONTEXT.get(uid)
+    if not msg.text.isdigit():
+        bot.reply_to(msg, "❌ Invalid number! Sirf digit bhein (e.g. 5):")
+        bot.register_next_step_handler(msg, process_min_participants_input)
+        return
+    
+    db.db_set_setting(f"MIN_PARTICIPANTS_{mid}", msg.text.strip())
+    
+    bot.send_message(msg.chat.id, (
+        f"✅ *Min Participants set to: {msg.text}*\n\n"
+        "Ab is match ke liye *Players* bhein.\n"
+        "Format: `Name | Role | Desig | Team` \n"
+        "Multiple lines bhej sakte hain."
+    ), parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_player_addition)
 
 @bot.message_handler(commands=['set_live_link'])
 def cmd_set_live_link(msg):
@@ -3203,84 +3344,18 @@ def process_player_addition(msg):
 
         # Wizard Flow: Check if we should proceed to contest setup
         if ADMIN_MATCH_CONTEXT.get(uid + "_wizard"):
-            bot.send_message(msg.chat.id, "✅ *Players Sync Ho Gaye!*\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots | comm%` (e.g. `100 | 50 | 10`)", parse_mode='Markdown')
-            bot.register_next_step_handler(msg, process_mega_setup)
+            wizard_text = (
+                "✅ *Players Added Successfully!*\n\n"
+                "Ab is match ke liye battles (Contests) setup karein.\n\n"
+                "Format: `fee | slots | Type (J/S)` \n"
+                "Example: `50 | 100 | J` (Jackpot) or `20 | 200 | S` (Saver)\n\n"
+                "Jab saare contests add ho jayein, toh `done` likhein."
+            )
+            bot.send_message(msg.chat.id, wizard_text, parse_mode='Markdown')
+            bot.register_next_step_handler(msg, process_flexible_contest_setup)
 
     except Exception as e:
         bot.reply_to(msg, f"❌ Error: {e}")
-
-def process_mega_setup(msg):
-    if not is_admin(msg.from_user.id): return
-    uid = str(msg.from_user.id)
-    mid = ADMIN_MATCH_CONTEXT.get(uid)
-    
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_medium_setup)
-        return
-
-    try:
-        parts = [p.strip() for p in msg.text.split("|")]
-        fee, slots = int(parts[0]), int(parts[1])
-        comm = int(parts[2]) if len(parts) > 2 else None
-        
-        db.db_set_contest_config(mid, fee, slots)
-        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
-        
-        txt = (f"✅ *MEGA Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
-               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
-               f"Ab **🥈 MEDIUM Contest** details bhein (`fee | slots`) ya `skip` likhein:")
-        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_medium_setup)
-    except:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `100 | 50`)")
-        bot.register_next_step_handler(msg, process_mega_setup)
-
-def process_medium_setup(msg):
-    if not is_admin(msg.from_user.id): return
-    uid = str(msg.from_user.id)
-    mid = ADMIN_MATCH_CONTEXT.get(uid)
-
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "⏭️ Medium skipped. Ab **🥉 SMALL Contest** bhein (`fee | slots`):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_small_setup)
-        return
-
-    try:
-        parts = [p.strip() for p in msg.text.split("|")]
-        fee, slots = int(parts[0]), int(parts[1])
-        comm = int(parts[2]) if len(parts) > 2 else None
-
-        db.db_set_contest_config(mid, fee, slots)
-        bd = ui.get_prize_breakdown(fee, slots, custom_comm=comm)
-        
-        txt = (f"✅ *MEDIUM Contest Set!*\n\n💰 Total Collection: ₹{bd['collection']}\n✂️ *Admin Cut ({bd['comm_pct']}%): ₹{bd['commission_amt']}*\n🎁 *Batega (Pool): ₹{bd['pool']}*\n\n"
-               f"✨ Winners: {bd['winners']} | 🥇 Rank 1: ₹{bd['1st']}\n\n"
-               f"Ab **🥉 SMALL Contest** details bhein (`fee | slots`) ya `skip` likhein:")
-        bot.send_message(msg.chat.id, txt, parse_mode='Markdown')
-        bot.register_next_step_handler(msg, process_small_setup)
-    except:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`)")
-        bot.register_next_step_handler(msg, process_medium_setup)
-
-def process_small_setup(msg):
-    if not is_admin(msg.from_user.id): return
-    uid = str(msg.from_user.id)
-    mid = ADMIN_MATCH_CONTEXT.get(uid)
-    ADMIN_MATCH_CONTEXT.pop(uid + "_wizard", None) # Wizard complete
-
-    if msg.text.lower() == 'skip':
-        bot.send_message(msg.chat.id, "✅ *Match Setup Complete!* Sabhi updates live hain.")
-        return
-
-    try:
-        parts = [p.strip() for p in msg.text.split("|")]
-        fee, slots = int(parts[0]), int(parts[1])
-        db.db_set_contest_config(mid, fee, slots)
-        bot.send_message(msg.chat.id, "✅ *SMALL Contest Set!*\n\n🚀 *Match Setup Complete!* Match ab users ke liye dashboard par live hai.")
-    except:
-        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `20 | 200`)")
-        bot.register_next_step_handler(msg, process_small_setup)
 
 @bot.message_handler(commands=['list_players'])
 def cmd_list_players(msg):
@@ -3443,7 +3518,7 @@ def cmd_update_points(msg):
                 score = float(parts[-1])
             scores = {player: score}
         
-        if calculate_all_points(mid, scores):
+        if calculate_all_points(mid, scores, is_final=False):
             bot.reply_to(msg, f"✅ Points updated for Match `{mid}`!")
         else:
             bot.reply_to(msg, "❌ Error calculating points.")
