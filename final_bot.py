@@ -2195,8 +2195,11 @@ def process_handle_setting(msg):
         bot.reply_to(msg, "❌ Error! Format: `TYPE | HANDLE`")
 
 @bot.message_handler(commands=['get_user_data'])
-def cmd_get_user_data(msg):
-    if not is_admin(msg.from_user.id): return
+def cmd_get_user_data(msg, admin_id=None):
+    # Dashboard se call hone par admin_id pass hota hai
+    uid_to_check = admin_id if admin_id else msg.from_user.id
+    if not is_admin(uid_to_check): return
+
     sent = bot.send_message(msg.chat.id, "👤 *USER DATA DUMP*\n\nJis user ka data chahiye, uski User ID bhein:", parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_get_user_data_input)
 
@@ -2519,7 +2522,7 @@ def handle_selection(call):
 
     parts = call.data.split("_")
     match_id, team_num, role = parts[1], int(parts[2]), parts[3]
-    player_name = " ".join(parts[4:])
+    player_name = " ".join(parts[4:]).replace('_', ' ') # Fix: Space restore karein
     cache_key = (uid, match_id, team_num)
 
     if is_match_locked(match_id):
