@@ -49,4 +49,10 @@ def update_match_event(match_id, player_name, event_type):
                 final_points = points * multiplier
                 conn.execute("UPDATE TEAMS SET points = points + %s WHERE user_id=%s AND match_id=%s AND team_num=%s",
                              (final_points, team['user_id'], match_id, team['team_num']))
+                
+                # ⚡ Cache Invalidation: Invalidate the team cache in final_bot so latest points are shown
+                from final_bot import temp_team_cache
+                cache_key = (str(team['user_id']), match_id, int(team['team_num']))
+                if cache_key in temp_team_cache:
+                    del temp_team_cache[cache_key]
     return True
