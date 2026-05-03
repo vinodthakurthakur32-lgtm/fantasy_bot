@@ -2820,6 +2820,13 @@ def process_match_end(match_id):
     try:
         # Fetch all player live stats for this match
         player_live_scores_map = db.db_get_all_player_scores(match_id)
+
+        # Check if anyone actually joined the match
+        participant_count = db.db_get_match_participant_count(match_id)
+        if participant_count == 0:
+            bot.send_message(ADMIN_ID, f"ℹ️ <b>Match {match_id} Ended:</b> Koi paid participants nahi the, isliye settlement skip kar di gayi.")
+            db.db_mark_points_calculated(match_id)
+            return
         
         if calculate_all_points(match_id, player_live_scores_map):
             db.db_mark_points_calculated(match_id) # DB mein mark karein
@@ -2831,7 +2838,9 @@ def process_match_end(match_id):
             bot.send_message(ADMIN_ID, f"✅ <b>Points Calculated for Match: {html.escape(MATCHES[match_id]['name'])}</b>", parse_mode='HTML')
             logging.info(f"✅ Points calculation completed for match: {match_id}")
         else:
-            bot.send_message(ADMIN_ID, f"❌ <b>Error in point calculation for Match: {html.escape(MATCHES[match_id]['name'])}</b>", parse_mode='HTML')
+            # Error message ko admin ke liye verbose banaya
+            err_msg = f"❌ <b>Settlement Failed:</b> {html.escape(str(match_id))}\nCheck logic in <code>calculate_all_points</code>."
+            bot.send_message(ADMIN_ID, err_msg, parse_mode='HTML')
             logging.error(f"❌ Error in point calculation for match: {match_id}")
     except Exception as e:
         logging.error(f"Error in process_match_end for {match_id}: {e}")
@@ -2880,7 +2889,7 @@ def calculate_all_points(match_id, player_scores):
             conn.execute("""
                 SELECT t.*, l.amount as entry_fee 
                 FROM TEAMS t 
-                JOIN LEDGER l ON l.reference_id LIKE 'DEBIT_MATCH_' || t.match_id || '_' || t.team_num || '_%'
+                JOIN LEDGER l ON l.reference_id LIKE 'DEBIT_MATCH_' || t.match_id || '_' || t.team_num || '_%%'
                 WHERE t.match_id = %s AND t.is_paid = 1
             """, (match_id,))
             all_paid_teams = conn.fetchall()
@@ -3491,4 +3500,3 @@ if __name__ == "__main__":
                 )
             except Exception as e:
                 logging.error(f"Polling Error: {e}")
-                time.sleep(3)
