@@ -50,7 +50,9 @@ def admin_event_markup(match_id, players, active_role='bat', is_locked=False, st
     if is_locked:
         markup.row(types.InlineKeyboardButton("🏁 DECLARE FINAL RESULT & PAY WINNERS", callback_data=f"adm_settle_ask_{match_id}"))
     
-    # 🌧️ Scenario: Match Abandoned / Refund All
+    # 🔄 MASTER SYNC (Fix all errors)
+    markup.row(types.InlineKeyboardButton("🔄 RE-SYNC ALL POINTS (Magic Fix)", callback_data=f"adm_resync_{match_id}"))
+    
     markup.row(types.InlineKeyboardButton("🌧️ ABANDON MATCH (Refund All)", callback_data=f"adm_refund_ask_{match_id}"))
 
     # Bulk Update Option
@@ -112,7 +114,13 @@ def handle_admin_nav(call, bot):
     elif nav == "adm_nav_get_user":
         bot.answer_callback_query(call.id)
         final_bot.cmd_get_user_data(call.message, admin_id=call.from_user.id)
-
+    
+    elif nav.startswith("adm_bulk_up_"):
+        match_id = nav.split("_")[3]
+        bot.answer_callback_query(call.id)
+        sent = bot.send_message(chat_id, f"📝 <b>BULK TOTALS: {match_id}</b>\n\nFormat: <code>Player Name | Runs | Wickets</code>\nMultiple lines bhein.\n\n<i>Note: Ye purane score ko overwrite kar dega.</i>", parse_mode='HTML')
+        bot.register_next_step_handler(sent, final_bot.process_bulk_scoring, match_id)
+        
     elif nav.startswith("adm_fin_"):
         bot.answer_callback_query(call.id)
         match_id = nav.split("_")[2]
@@ -138,6 +146,14 @@ def handle_admin_nav(call, bot):
         match_name = final_bot.MATCHES.get(match_id, {}).get('name', match_id)
         text = f"🎮 <b>LIVE SCORING: {html.escape(str(match_name))}</b>\n\nSelect player and event to update points."
         bot.edit_message_text(text, chat_id, mid, reply_markup=markup, parse_mode='HTML')
+
+    elif nav.startswith("adm_resync_"):
+        match_id = nav.split("_")[2]
+        bot.answer_callback_query(call.id, "⏳ Syncing all teams...", show_alert=False)
+        if scoring.recalculate_match_points(match_id):
+            bot.answer_callback_query(call.id, "✅ All team points synced and corrected!", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ Sync failed!", show_alert=True)
 
     elif nav.startswith("adm_filter_"):
         bot.answer_callback_query(call.id)
