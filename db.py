@@ -761,6 +761,11 @@ def db_mark_points_calculated(match_id):
     with get_db() as c:
         c.execute("UPDATE MATCHES_LIST SET points_calculated = 1 WHERE match_id = %s", (match_id,))
 
+def db_mark_prizes_distributed(match_id):
+    """Marks a match as settled with prizes distributed (Status 2)"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 2 WHERE match_id = %s", (match_id,))
+
 def db_set_manual_lock(match_id, status):
     """0: Auto, 1: Force Lock, -1: Force Unlock"""
     with get_db() as c:
@@ -897,3 +902,13 @@ def db_get_all_paid_entries(match_id):
         search_pattern = f"DEBIT_MATCH_{match_id}_%"
         c.execute("SELECT user_id, ABS(amount) as fee, reference_id, team_num FROM LEDGER WHERE reference_id LIKE %s AND type='DEBIT'", (search_pattern,))
         return c.fetchall()
+
+def db_mark_prizes_distributed(match_id):
+    """Settlement status update: 2 = Prizes Distributed (Match Closed)"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 2 WHERE match_id = %s", (match_id,))
+
+def db_mark_points_calculated(match_id):
+    """Marks a match as points calculated (Status 1)"""
+    with get_db() as c:
+        c.execute("UPDATE MATCHES_LIST SET points_calculated = 1 WHERE match_id = %s", (match_id,))
