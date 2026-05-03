@@ -2267,6 +2267,9 @@ def process_bulk_scoring(msg, match_id):
             if "|" not in line: continue
             parts = [p.strip() for p in line.split("|")]
             p_name, runs, wkts = parts[0], int(parts[1]), int(parts[2])
+            # Strip team tags like (RCB) if admin includes them in bulk
+            p_name = parts[0].split(' (')[0].strip()
+            runs, wkts = int(parts[1]), int(parts[2])
             
             # Set absolute values in DB
             db.db_set_player_stats_absolute(match_id, p_name, runs=runs, wickets=wkts)
@@ -2721,12 +2724,17 @@ def callback_catchall(call):
         return
     # Route Scoring events
     if call.data.startswith("evt|"):
-        bot.answer_callback_query(call.id, "⚡ Updating...")
         parts = call.data.split("|")
-        match_id, p_name = parts[1], parts[2]
-        scoring.update_match_event(match_id, p_name, parts[3])
+        match_id, p_name, event = parts[1], parts[2], parts[3]
         
-        # 🔄 Refresh Admin Scoring Panel to show new scores on buttons
+        # 1. Fast Player Stat Update (Synchronous)
+        scoring.update_player_stat_only(match_id, p_name, event)
+        bot.answer_callback_query(call.id, "⚡ Score Updated!")
+
+        # 2. Heavy Team Points Update (Background Thread)
+        threading.Thread(target=scoring.update_team_points_incrementally, args=(match_id, p_name, event)).start()
+        
+        # 3. Immediate UI Refresh
         import admin_app
         players_data = get_players(match_id)
         stats_map = db.db_get_player_live_stats_map(match_id)
