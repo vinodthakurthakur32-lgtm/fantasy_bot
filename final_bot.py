@@ -1027,11 +1027,16 @@ def callback_confirm_join(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_match_"))
 def callback_show_match(call):
     # show_match_{mid}
+    bot.answer_callback_query(call.id)
     mid = "_".join(call.data.split("_")[2:])
     uid = str(call.from_user.id)
     default_fee = 100
     
     info = MATCHES.get(mid)
+    if not info:
+        bot.send_message(call.message.chat.id, "❌ Match data load nahi ho paya. Kripya /contest dobara karein.")
+        return
+
     stats = db.get_contest_stats(mid, default_fee)
     user_summary = db.get_user_match_summary(uid, mid)
     has_team = db_has_saved_team(uid, mid)
