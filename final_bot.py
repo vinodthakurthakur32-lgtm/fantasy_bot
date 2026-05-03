@@ -217,11 +217,13 @@ def process_payment_success(user_id, amount, ref_id, match_context=None, conn=No
 
         # 3. Mark team/context as paid
         if match_context and "_" in match_context:
-            mid, tnum = match_context.split("_")
+            ctx_parts = match_context.split("_")
+            tnum = ctx_parts[-1]
+            mid = "_".join(ctx_parts[:-1])
             if mid != "wallet":
                 # Fetch amount for this join to create a DEBIT entry
                 # This ensures wallet balance remains correct and settlement picks it up
-                c.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                c.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, %s, %s, %s)",
                           (str(user_id), -amount, 'DEBIT', f"DEBIT_MATCH_{mid}_{tnum}_{ref_id}", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
                 
                 c.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (str(user_id), mid, int(tnum)))
@@ -766,7 +768,8 @@ def callback_view_team(call):
         return
 
     match_name = MATCHES.get(match_id, {}).get('name', match_id)
-    markup, text = ui.team_view_render(match_id, match_name, team_num, team, is_match_locked(match_id))
+    joined_fees = db.db_get_team_joined_contests(uid, match_id, team_num)
+    markup, text = ui.team_view_render(match_id, match_name, team_num, team, is_match_locked(match_id), joined_fees=joined_fees)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pts_break_"))
@@ -1267,7 +1270,9 @@ def send_payment_ui(chat_id, uid, amount, match_id, team_num):
 def callback_wallet_pay(call):
     uid = str(call.from_user.id)
     parts = call.data.split("_")
-    match_id, team_num, amount = parts[2], parts[3], int(parts[4])
+    amount = int(parts[-1])
+    team_num = int(parts[-2])
+    match_id = "_".join(parts[2:-2])
     
     try:
         with db.get_db() as conn:
@@ -1283,8 +1288,14 @@ def callback_wallet_pay(call):
                 (uid, -amount, ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             conn.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (uid, match_id, team_num))
+            
+            # ⚡ Cache Invalidation: Refresh data for UI
+            cache_key = (uid, match_id, team_num)
+            if cache_key in temp_team_cache:
+                del temp_team_cache[cache_key]
         
-        bot.edit_message_caption(caption=f"✅ *Success!*\n₹{amount} deducted from wallet.\nTeam {team_num} is now active for {MATCHES[match_id]['name']}.", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='Markdown')
+        match_name = MATCHES.get(match_id, {}).get('name', match_id)
+        bot.edit_message_text(text=f"✅ *Success!*\n₹{amount} deducted from wallet.\nTeam {team_num} is now active for {match_name}.", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='Markdown')
         bot.answer_callback_query(call.id, "Match Joined!")
     except Exception as e:
         logging.error(f"Wallet pay error: {e}")
@@ -1321,7 +1332,8 @@ def handle_screenshot(msg):
 
     active_context = intent['match_context']
     parts = active_context.split("_")
-    match_id, team_num = parts[0], parts[1]
+    team_num = parts[-1]
+    match_id = "_".join(parts[:-1])
     amount = intent['amount']
 
     if match_id != "wallet":
@@ -1490,7 +1502,9 @@ def handle_utr_input(msg):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def callback_approve(call):
     parts = call.data.split("_")
-    uid, mid, tnum = parts[1], parts[2], parts[3]
+    uid = parts[1]
+    tnum = parts[-1]
+    mid = "_".join(parts[2:-1])
     bot.answer_callback_query(call.id)
 
     with db.get_db() as conn:
