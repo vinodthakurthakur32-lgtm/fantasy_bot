@@ -2701,9 +2701,17 @@ def callback_catchall(call):
         return
     # Route Scoring events
     if call.data.startswith("evt|"):
+        bot.answer_callback_query(call.id, "⚡ Updating...")
         parts = call.data.split("|")
-        scoring.update_match_event(parts[1], parts[2], parts[3])
-        bot.answer_callback_query(call.id, "✅ Point Updated!")
+        match_id, p_name = parts[1], parts[2]
+        scoring.update_match_event(match_id, p_name, parts[3])
+        
+        # 🔄 Refresh Admin Scoring Panel to show new scores on buttons
+        import admin_app
+        players_data = get_players(match_id)
+        stats_map = db.db_get_player_live_stats_map(match_id)
+        markup = admin_app.admin_event_markup(match_id, players_data, stats_map=stats_map, is_locked=True)
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
     logging.info(f"Unmatched callback: {call.data}")
