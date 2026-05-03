@@ -3694,63 +3694,6 @@ def process_delete_contest_callback(msg):
 # START BOT
 # ===================================================
 
-@bot.message_handler(commands=['admin_panel', 'recent_users'])
-def cmd_admin(msg):
-    if not is_admin(msg.from_user.id):
-        bot.reply_to(msg, f"🚫 **Access Denied!**\nAapka User ID (`{msg.from_user.id}`) admin list mein nahi hai.", parse_mode='Markdown')
-        return
-
-    try:
-        stats = db.get_admin_stats()
-        markup, text = ui.admin_dashboard_home(stats, MATCHES)
-        bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode='HTML')
-    except Exception as e:
-        logging.error(f"Admin Dashboard Error: {e}")
-
-# ===================================================
-# REFUND & CANCELLATION SYSTEM
-# ===================================================
-
-def process_contest_cancellation_and_refund(match_id, fee, contest_teams_list):
-    """Refunds users if a contest tier doesn't meet minimum participants"""
-    match_name = MATCHES.get(match_id, {}).get('name', match_id)
-    for team in contest_teams_list:
-        uid = str(team['user_id'])
-        tnum = team['team_num']
-        ref_id = f"REFUND_AUTO_{match_id}_{fee}_{tnum}"
-        
-        try:
-            with db.get_db() as conn:
-                conn.execute("SELECT id FROM LEDGER WHERE reference_id=%s", (ref_id,))
-                if conn.fetchone(): continue
-
-                conn.execute(
-                    "INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'CREDIT', %s, %s)",
-                    (uid, fee, ref_id, get_now().strftime('%Y-%m-%d %H:%M:%S'))
-                )
-                conn.execute("UPDATE TEAMS SET is_paid=0 WHERE user_id=%s AND match_id=%s AND team_num=%s", (uid, match_id, tnum))
-            
-            text = (f"⚠️ *Contest Cancelled: {match_name}*\n\nAapne ₹{fee} wale contest mein join kiya tha, par participants kam hone ke karan contest cancel kar diya gaya hai.\n\n💰 *₹{fee}* aapke wallet mein wapas bhej diye gaye hain.")
-            try: bot.send_message(uid, text, parse_mode='Markdown')
-            except: pass
-        except Exception as e:
-            logging.error(f"Refund error for user {uid}: {e}")
-
-def process_match_refund(match_id):
-    """Abandons match and refunds all paid entries manually"""
-    logging.info(f"🌧️ Manually refunding all entries for match: {match_id}")
-    entries = db.db_get_all_paid_entries(match_id)
-    if not entries:
-        bot.send_message(ADMIN_ID, f"ℹ️ Match `{match_id}` mein koi paid entries nahi mili.")
-        return
-
-    for entry in entries:
-        # entry format from db: user_id, fee, reference_id, team_num
-        process_contest_cancellation_and_refund(match_id, entry['fee'], [entry])
-    
-    db.db_mark_points_calculated(match_id)
-    bot.send_message(ADMIN_ID, f"✅ *Refund Complete!* Match `{match_id}` settled with refunds.")
-
 # ===================================================
 # INITIALIZATION
 # ===================================================
