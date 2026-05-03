@@ -221,6 +221,11 @@ def process_payment_success(user_id, amount, ref_id, match_context=None, conn=No
             if mid != "wallet":
                 c.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (str(user_id), mid, int(tnum)))
                 
+                # ⚡ Cache Clear: Taaki user ko turant "Paid: ✅ YES" dikhe
+                cache_key = (str(user_id), mid, int(tnum))
+                if cache_key in temp_team_cache:
+                    del temp_team_cache[cache_key]
+                
                 # 🎁 Check for Referral Reward (First Contest Join)
                 c.execute("SELECT referred_by FROM USERS WHERE user_id=%s", (str(user_id),))
                 user_info = c.fetchone()
@@ -1018,11 +1023,42 @@ def callback_join_match(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_join_"))
 def callback_confirm_join(call):
     parts = call.data.split("_")
-    # confirm_join_{mid}_{tnum}_{fee}
-    fee = int(parts[-1])
-    team_num = parts[-2]
-    match_id = "_".join(parts[2:-2])
-    callback_pay_now(call) # Use the existing payment flow logic
+    # Format: confirm_join_{mid}_{tnum}_{fee}
+    try:
+        fee = int(parts[-1])
+        tnum = int(parts[-2])
+        mid = "_".join(parts[2:-2])
+    except: return
+
+    uid = str(call.from_user.id)
+    team = db_get_team(uid, mid, tnum)
+
+    # 1. Direct Entry: Agar pehle hi pay kar diya hai
+    if team and team.get('is_paid'):
+        bot.answer_callback_query(call.id, "✅ Aap is team se join kar chuke hain!", show_alert=True)
+        call.data = f"show_match_{mid}"
+        return callback_show_match(call)
+
+    # 2. Wallet Check: Agar balance hai toh direct pay option dein
+    balance = db.db_get_wallet_balance(uid)
+    if balance >= fee:
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"💳 PAY ₹{fee} FROM WALLET", callback_data=f"wallet_pay_{mid}_{tnum}_{fee}"),
+            types.InlineKeyboardButton("🔙 BACK", callback_data=f"show_match_{mid}")
+        )
+        text = (
+            f"🏅 *Join Contest - {MATCHES[mid]['name']}*\n\n"
+            f"Slot: `Team {tnum}`\n"
+            f"Entry Fee: *₹{fee}*\n\n"
+            f"💰 Wallet Balance: *₹{balance}*\n\n"
+            "Aapke wallet mein balance hai. Kya aap join karna chahte hain?"
+        )
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+        return
+
+    # 3. No Balance: Tabhi payment screen par bhejein
+    send_payment_ui(call.message.chat.id, uid, fee, mid, str(tnum))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_match_"))
 def callback_show_match(call):
@@ -1203,8 +1239,11 @@ def callback_pay_now(call):
         match_id, team_num = "wallet", "0"
         amount = int(db.db_get_user_state(uid, 'deposit_amount') or 100)
     else:
-        match_id, team_num, amount = parts[2], parts[3], int(parts[4])
-        team = db_get_team(uid, match_id, int(team_num)) or {}
+        amount = int(parts[-1])
+        team_num = int(parts[-2])
+        match_id = "_".join(parts[2:-2])
+        
+        team = db_get_team(uid, match_id, team_num) or {}
         if not team or not team.get('team_saved'):
             bot.answer_callback_query(call.id, "❌ Pehle team save karein!", show_alert=True)
             return
@@ -1222,8 +1261,11 @@ def send_payment_ui(chat_id, uid, amount, match_id, team_num):
     db.db_set_user_state(uid, 'deposit_amount', amount)
     db.db_set_user_state(uid, 'active_match_context', context)
 
+    is_wallet = (match_id == "wallet")
+    title = "💳 *Deposit to Wallet*" if is_wallet else f"🏆 *Contest Join - {MATCHES[match_id]['name']}*"
+    
     pay_msg = (
-        "💳 *Add Money*\n\n"
+        f"{title}\n\n"
         f"Amount: *₹{amount}*\n"
         f"UPI: `{PAYMENT_UPI}`\n\n"
         "👉 *After payment:*\n"
