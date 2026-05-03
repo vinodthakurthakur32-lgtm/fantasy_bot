@@ -754,3 +754,12 @@ def db_set_live_link(match_id, link):
     with get_db() as c:
         c.execute("UPDATE MATCHES_LIST SET live_link = %s WHERE match_id = %s", (link, match_id))
     return True
+
+def db_get_team_joined_contests(user_id, match_id, team_num):
+    """Ek team ne is match mein kaunse fees wale contests join kiye hain"""
+    with get_db() as c:
+        # reference_id pattern: DEBIT_MATCH_{mid}_{tnum}_{timestamp}
+        search_pattern = f"DEBIT_MATCH_{match_id}_{team_num}_%"
+        c.execute("SELECT ABS(amount) as fee FROM LEDGER WHERE user_id=%s AND reference_id LIKE %s", (str(user_id), search_pattern))
+        rows = c.fetchall()
+        return [int(r['fee']) for r in rows]
