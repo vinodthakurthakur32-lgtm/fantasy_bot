@@ -219,6 +219,11 @@ def process_payment_success(user_id, amount, ref_id, match_context=None, conn=No
         if match_context and "_" in match_context:
             mid, tnum = match_context.split("_")
             if mid != "wallet":
+                # Fetch amount for this join to create a DEBIT entry
+                # This ensures wallet balance remains correct and settlement picks it up
+                c.execute("INSERT INTO LEDGER (user_id, amount, type, reference_id, timestamp) VALUES (%s, %s, 'DEBIT', %s, %s)",
+                          (str(user_id), -amount, 'DEBIT', f"DEBIT_MATCH_{mid}_{tnum}_{ref_id}", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                
                 c.execute("UPDATE TEAMS SET is_paid=1 WHERE user_id=%s AND match_id=%s AND team_num=%s", (str(user_id), mid, int(tnum)))
                 
                 # ⚡ Cache Clear: Taaki user ko turant "Paid: ✅ YES" dikhe
@@ -1022,6 +1027,7 @@ def callback_join_match(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_join_"))
 def callback_confirm_join(call):
+    bot.answer_callback_query(call.id)
     parts = call.data.split("_")
     # Format: confirm_join_{mid}_{tnum}_{fee}
     try:
@@ -1032,12 +1038,6 @@ def callback_confirm_join(call):
 
     uid = str(call.from_user.id)
     team = db_get_team(uid, mid, tnum)
-
-    # 1. Direct Entry: Agar pehle hi pay kar diya hai
-    if team and team.get('is_paid'):
-        bot.answer_callback_query(call.id, "✅ Aap is team se join kar chuke hain!", show_alert=True)
-        call.data = f"show_match_{mid}"
-        return callback_show_match(call)
 
     # 2. Wallet Check: Agar balance hai toh direct pay option dein
     balance = db.db_get_wallet_balance(uid)
@@ -2638,8 +2638,10 @@ def cmd_download_db(msg):
 @bot.message_handler(commands=['setup_contests'])
 def cmd_setup_contests(msg):
     """Ek hi match ke liye teeno (Mega, Med, Small) contests set karne ka wizard"""
+    """Match ke liye unlimited contests add karne ka loop wizard"""
     if not is_admin(msg.from_user.id): return
     sent = bot.send_message(msg.chat.id, "🎯 *CONTEST SETUP WIZARD*\n\nMatch ID bhein jiske liye contests set karne hain (e.g. `m1`):", parse_mode='Markdown')
+    sent = bot.send_message(msg.chat.id, "🎯 *FLEXIBLE CONTEST SETUP*\n\nMatch ID bhein (e.g. `m1`):", parse_mode='Markdown')
     bot.register_next_step_handler(sent, process_setup_contests_start)
 
 def process_setup_contests_start(msg):
@@ -2651,11 +2653,17 @@ def process_setup_contests_start(msg):
     ADMIN_MATCH_CONTEXT[uid] = mid
     bot.send_message(msg.chat.id, f"✅ Match `{mid}` selected.\n\nAb **🥇 MEGA Contest** setup karein.\nFormat: `fee | slots` (e.g. `100 | 50`)", parse_mode='Markdown')
     bot.register_next_step_handler(msg, process_mega_setup)
+    bot.send_message(msg.chat.id, f"✅ Match `{mid}` selected.\n\nAb contest details bhein: `fee | slots` \nExample: `50 | 100` \n\nJab saare add ho jayein toh `done` likhein.", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_flexible_contest_setup)
 
 def process_mega_setup(msg):
     if not is_admin(msg.from_user.id): return # Admin check
     uid = str(msg.from_user.id)
     mid = ADMIN_MATCH_CONTEXT.get(uid)
+def process_flexible_contest_setup(msg):
+    if msg.text.lower() == 'done':
+        bot.send_message(msg.chat.id, "✅ *All Contests Configured!* Match live hai.")
+        return
     
     if msg.text.lower() == 'skip':
         bot.send_message(msg.chat.id, "⏭️ Mega skipped. Ab **🥈 MEDIUM Contest** bhein (`fee | slots`):", parse_mode='Markdown')
@@ -2705,6 +2713,10 @@ def process_medium_setup(msg):
     except Exception:
         bot.reply_to(msg, "❌ Invalid format. Use `fee | slots` (e.g. `50 | 100`) or `skip`.")
         bot.register_next_step_handler_by_chat_id(msg.chat.id, process_medium_setup)
+        bot.reply_to(msg, f"✅ Added: ₹{fee} ({slots} slots). Agla bhein ya `done` likhein.")
+    except:
+        bot.reply_to(msg, "❌ Invalid format. Use `fee | slots`.")
+    bot.register_next_step_handler(msg, process_flexible_contest_setup)
 
 def process_small_setup(msg):
     if not is_admin(msg.from_user.id): return
