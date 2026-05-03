@@ -36,15 +36,8 @@ def admin_event_markup(match_id, players, active_role='bat', is_locked=False, st
             stats = stats_map.get(p_name, {'runs': 0, 'wickets': 0}) if stats_map else {'runs': 0, 'wickets': 0}
             stats_label = f"({stats['runs']}R, {stats['wickets']}W)"
             
-            # Row 1: Player Full Name + Current Score
+            # Ab sirf player ka naam aur current total score dikhega
             markup.row(types.InlineKeyboardButton(f"👤 {p_display} {stats_label}", callback_data="ignore"))
-            # Row 2: Incremental buttons
-            markup.row(
-                types.InlineKeyboardButton("+1 R", callback_data=f"evt|{match_id}|{p_name}|run"),
-                types.InlineKeyboardButton("+4 R", callback_data=f"evt|{match_id}|{p_name}|four"),
-                types.InlineKeyboardButton("+6 R", callback_data=f"evt|{match_id}|{p_name}|six"),
-                types.InlineKeyboardButton("+1 W", callback_data=f"evt|{match_id}|{p_name}|wicket")
-            )
 
     # Match locked hai toh Result declare karne ka option dein
     if is_locked:
