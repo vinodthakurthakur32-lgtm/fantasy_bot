@@ -59,7 +59,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS TEAMS (
             user_id VARCHAR(255), match_id VARCHAR(255), team_players TEXT, captain TEXT, vice_captain TEXT,
             team_saved INTEGER DEFAULT 0, team_num INTEGER DEFAULT 1,
-            is_paid INTEGER DEFAULT 0, points INTEGER DEFAULT 0,
+            is_paid INTEGER DEFAULT 0, points NUMERIC DEFAULT 0,
             PRIMARY KEY (user_id, match_id, team_num)
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS PAYMENTS (
@@ -487,9 +487,10 @@ def db_get_match_financials(match_id):
 def get_contest_stats(match_id, entry_fee=100):
     """Fetches real-time participation stats for a match dashboard"""
     with get_db() as c:
-        # Real count from database
-        c.execute("SELECT COUNT(*) as count FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
-        real_joined = c.fetchone()['count']
+        # Count actual entries from LEDGER instead of just team slots
+        search_pattern = f"DEBIT_MATCH_{match_id}_%"
+        c.execute("SELECT COUNT(*) as count FROM LEDGER WHERE reference_id LIKE %s AND ABS(amount) = %s", (search_pattern, entry_fee))
+        real_joined = c.fetchone()['count'] or 0
 
         fake_base = int(db_get_setting('FAKE_PARTICIPANTS_BASE', 0))
         c.execute("SELECT max_slots FROM CONTEST_CONFIG WHERE match_id=%s AND entry_fee=%s", (match_id, entry_fee))
@@ -707,7 +708,8 @@ def db_get_user_rank(user_id, match_id):
 
 def db_get_match_participant_count(match_id):
     with get_db() as c:
-        c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM TEAMS WHERE match_id=%s AND is_paid=1", (match_id,))
+        search_pattern = f"DEBIT_MATCH_{match_id}_%"
+        c.execute("SELECT COUNT(*) as cnt FROM LEDGER WHERE reference_id LIKE %s", (search_pattern,))
         row = c.fetchone()
         if not row: return 0
         return row.get('cnt', 0) if isinstance(row, dict) else row[0]
