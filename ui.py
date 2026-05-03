@@ -23,7 +23,8 @@ def home_screen_markup(matches):
     
     markup.row(
         types.InlineKeyboardButton("💰 Wallet", callback_data="app_wallet"),
-        types.InlineKeyboardButton("🏆 Ranks", callback_data="app_global_ranks")
+        types.InlineKeyboardButton("🏆 Ranks", callback_data="app_global_ranks"),
+        types.InlineKeyboardButton("📜 My Results", callback_data="my_results")
     )
     return markup, "📱 *CRICK-TEAM11 DASHBOARD*\n\nSelect a live match to view real-time scoring and your standing."
 
@@ -52,28 +53,38 @@ def lock_screen_markup():
 
 def admin_match_finance_render(match_id, match_name, fin_data):
     comm_pct = float(db.db_get_setting('PRIZE_COMMISSION', 18))
-    total_collection = fin_data['collection']
-    admin_cut = (total_collection * comm_pct) / 100
-    prize_pool = total_collection - admin_cut
     
     res = (
         f"💰 *FINANCIAL SUMMARY: {match_name}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Total Collection: `₹{total_collection}`\n"
-        f"✂️ Admin Cut ({comm_pct}%): `₹{admin_cut}`\n"
-        f"🎁 Total Prize Pool: `₹{prize_pool}`\n"
-        f"👥 Paid Entries: `{fin_data['entries']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *PRIZE BREAKDOWN (Per Contest Type):*\n"
     )
     
-    for cfg in fin_data['configs']:
-        bd = get_prize_breakdown(cfg['entry_fee'], cfg['max_slots'], match_id=match_id)
+    for con in fin_data['contests']:
+        fee = con['fee']
+        col = con['collection']
+        ent = con['entries']
+        c_type = con.get('type', 'J')
+        
+        # Match logic: Saver has 10% commission, others use global setting
+        actual_comm = 10.0 if c_type == 'S' else comm_pct
+        cut = (col * actual_comm) / 100
+        pool = col - cut
+        type_label = "⚡ JACKPOT" if c_type == 'J' else "🛡️ TEAM SAVER"
+        
         res += (
-            f"\n📍 *Contest ₹{cfg['entry_fee']} ({cfg['max_slots']} slots):*\n"
-            f"🥇 1st: ₹{bd.get('1st', 0)} | 🥈 2nd: ₹{bd.get('2nd', 0)}\n"
-            f"🥉 3rd: ₹{bd.get('3rd', 0)} | 🏅 4-10: ₹{bd.get('4-10', bd.get('4th', 0))}\n"
+            f"{type_label} *₹{int(fee)}*\n"
+            f"👥 Entries: `{ent}` | 📈 Collection: `₹{col}`\n"
+            f"✂️ Cut ({actual_comm}%): `₹{round(cut, 2)}`\n"
+            f"🎁 Prize Pool: `₹{round(pool, 2)}`\n"
+            f"--------------------\n"
         )
+
+    res += (
+        f"📊 *TOTAL OVERALL*\n"
+        f"💰 Collection: `₹{fin_data['total_collection']}`\n"
+        f"👥 Total Entries: `{fin_data['total_entries']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_fin_{match_id}"))
@@ -90,6 +101,7 @@ def admin_dashboard_home(stats, matches):
         types.InlineKeyboardButton("🔗 Referrals", callback_data="adm_nav_refs"),
         types.InlineKeyboardButton(fraud_btn_text, callback_data="adm_nav_fraud"),
         types.InlineKeyboardButton("🏆 Leaderboard", callback_data="adm_nav_lead"),
+        types.InlineKeyboardButton("🔍 User Search", callback_data="adm_nav_get_user"),
     )
     markup.add(
         types.InlineKeyboardButton("📤 Data Backup", callback_data="adm_export_data"),
@@ -100,6 +112,10 @@ def admin_dashboard_home(stats, matches):
     if matches:
         markup.add(types.InlineKeyboardButton("━━━━━━━━━━━━━━", callback_data="ignore"))
         for mid, info in matches.items():
+            # ⚡ Skip settled matches to keep the admin panel clean
+            if info.get('points_calculated'):
+                continue
+                
             markup.row(
                 types.InlineKeyboardButton(f"🎮 Control: {info['name']}", callback_data=f"adm_ctrl_{mid}"),
                 types.InlineKeyboardButton("💰 Finance", callback_data=f"adm_fin_{mid}")
@@ -139,13 +155,14 @@ def admin_help_render():
    <i>Format: Name | Role | Desig | Team</i>
 • <code>/set_live_link</code> - <b>(NEW)</b> Streaming link set karein
    <i>Ex: m1 | https://aapka-streaming-link.com</i>
-3️⃣ <code>/setup_contests</code> - Ek sath Mega/Med/Small set karein
+3️⃣ <code>/setup_contests</code> - <b>Unlimited Jackpot/Saver</b> set karein
+   <i>Format: fee | slots | J/S (J=Jackpot, S=Saver)</i>
 
 🏆 <b>CONTESTS &amp; PLAYER MANAGEMENT</b>
 • <code>/delete_contest</code> - Particular contest hatayein
 • <code>/set_manual_prizes</code> - <b>(NEW)</b> Custom prize set karein
   <i>Format: mid | fee | R1 | R2 | R3 | R4-10 | Bottom | Winners</i>
-• <code>/set_contest_size</code> - Single contest modify karein
+• <code>/set_contest_size</code> - Contest modify <i>(mid | fee | slots | J/S)</i>
 • <code>/set_prize_config</code> - Global commission/payout set karein
 • <code>/my_matches</code> - Dashboard se match/player control karein (Buttons)
 • <code>/list_players</code> - <b>(NEW)</b> Interactive Squad (Click karke delete karein)
@@ -160,7 +177,10 @@ def admin_help_render():
 ⚙️ <b>ADVANCED SETTINGS</b>
 • <code>/set_fake_count</code> - <b>(HOT)</b> Display participants badhayein
 • <code>/set_handle</code> - Support/Channel links update karein
-• <code>/rules</code> - Point system update karein
+•ar <code>/rules</code> - Point system update karein
+• <code>/get_user_data</code> - User ka kacha-chittha nikalein
+• <code>/audit_match</code> - 🛡️ <b>Fairness Audit</b> (Match end ke baad)
+• <code>/rollback_match</code> - ⚠️ <b>Emergency:</b> Prizes wapas lein
 • <code>/clear_database</code> - ⚠️ Pura data saaf karein
 ━━━━━━━━━━━━━━━━━━━━
 💡 <i>Naya match setup karne ke liye Step 1, 2, 3 follow karein.</i>"""
@@ -269,11 +289,12 @@ def contest_list_render(matches):
     res += "\n⚠️ *No team?* \n👉 Pehle team banao taaki Battle join kar sako."
     return markup, res
 
-def get_prize_breakdown(fee, slots, custom_comm=None, match_id=None):
+def get_prize_breakdown(fee, slots, custom_comm=None, match_id=None, contest_type='J'):
     """Calculates distribution where all winners get >= fee and top ranks get surplus"""
     if match_id:
         manual = db.db_get_manual_prizes(match_id, fee)
         if manual:
+            # Manual prizes override automatic logic, type doesn't matter much here
             collection = fee * slots
             pool = manual['r1'] + manual['r2'] + manual['r3'] + (manual['r4_10'] * 7) + (manual['bottom'] * (manual['winners_count'] - 10))
             return {
@@ -293,23 +314,21 @@ def get_prize_breakdown(fee, slots, custom_comm=None, match_id=None):
     # Fetch dynamic settings from DB with defaults
     if custom_comm is not None:
         comm_val = float(custom_comm)
-    elif fee < 30: # Saver Contest (₹30 se kam)
+    elif contest_type == 'S': # Logic based on explicit type
         comm_val = 10.0 # 10% Admin Cut for maximum user happiness
     else: # Mini-Jackpot (>=₹30) and Mega (>=₹100)
         comm_val = float(db.db_get_setting('PRIZE_COMMISSION', 18)) # Global setting ya default 18%
     
-    if fee >= 100:
-        # 🥇 MEGA: Top 5 Big Win (35% Winners)
-        win_pct = 35
-        r1_pct, r2_pct, r3_pct, r4_pct, r5_pct = 40, 18, 12, 8, 5
-    elif fee >= 30:
-        # ⚡ MINI-JACKPOT: Top 5 Balanced (25% Winners)
+    if contest_type == 'J':
+        # ⚡ JACKPOT: High Risk, High Reward
+        # Winner kam, par jo jeetega wo bada jackpot le jayega
         win_pct = 25
-        r1_pct, r2_pct, r3_pct, r4_pct, r5_pct = 45, 20, 15, 10, 10
+        r1_pct, r2_pct, r3_pct, r4_pct, r5_pct = 70, 20, 10, 0, 0
     else:
-        # 🛡️ SAVER: 10% Cut, 60% Winners, Top 5 balanced for "Chaska"
-        win_pct = 60
-        r1_pct, r2_pct, r3_pct, r4_pct, r5_pct = 50, 15, 12, 10, 8
+        # 🛡️ SAVER: Low Risk, Maximum Refund (75% Winners)
+        # Focus on returning entry fee to max users
+        win_pct = 75
+        r1_pct, r2_pct, r3_pct, r4_pct, r5_pct = 30, 15, 10, 5, 5
 
     # Platform commission logic
     commission_multiplier = (100 - comm_val) / 100
@@ -321,51 +340,52 @@ def get_prize_breakdown(fee, slots, custom_comm=None, match_id=None):
     # Step 1: Guarantee every winner gets at least their entry fee back
     total_base_cost = winners_count * fee
     
-    # Safety check: if pool is too small for winner count, reduce it.
-    # Admin (18% cut) takes priority, so winners get what remains.
-    if total_base_cost > pool and winners_count > 1:
-        winners_count = pool // fee
+    # 🛡️ FIX: Agar pool total base cost se kam hai, toh winners kam karo
+    # Taaki admin commission (18%) hamesha safe rahe.
+    while total_base_cost > pool and winners_count > 1:
+        winners_count -= 1
         total_base_cost = winners_count * fee
-    
-    # Surplus calculation: pool minus the base entry fee refunds
-    actual_base_return = min(pool, total_base_cost)
-    surplus = max(0, pool - actual_base_return)
 
-    # Step 2: Calculate Surplus (extra money above the entry fee refunds)
-    surplus = pool - total_base_cost
+    surplus = max(0, pool - total_base_cost)
     
     top_total_pct = r1_pct + r2_pct + r3_pct + r4_pct + r5_pct
     remaining_pct = max(0, 100 - top_total_pct)
 
-    # Calculate share for remaining winners (Ranks 6-10)
-    r6_10_count = max(0, min(5, winners_count - 5))
-    rest_share = int((surplus * (remaining_pct / 100)) / r6_10_count) if r6_10_count > 0 else 0
+    # 🏆 Professional Scaling: Share remaining surplus among ALL winners after Rank 5
+    others_count = max(0, winners_count - 5)
+    
+    # If no others, redistribute remaining surplus to Rank 1 to make jackpot bigger
+    if others_count == 0 and winners_count > 0:
+        r1_pct += remaining_pct
+        remaining_pct = 0
+
+    rest_surplus_share = int((surplus * (remaining_pct / 100)) / others_count) if others_count > 0 else 0
 
     prizes = {
-        "1st": fee + int(surplus * (r1_pct / 100)),
-        "2nd": fee + int(surplus * (r2_pct / 100)),
-        "3rd": fee + int(surplus * (r3_pct / 100)),
-        "4th": fee + int(surplus * (r4_pct / 100)),
-        "5th": fee + int(surplus * (r5_pct / 100)),
-        "6-10": fee + rest_share
+        "1st": (fee if winners_count >= 1 else 0) + int(surplus * (r1_pct / 100)),
+        "2nd": (fee if winners_count >= 2 else 0) + int(surplus * (r2_pct / 100)),
+        "3rd": (fee if winners_count >= 3 else 0) + int(surplus * (r3_pct / 100)),
+        "4th": (fee if winners_count >= 4 else 0) + int(surplus * (r4_pct / 100)),
+        "5th": (fee if winners_count >= 5 else 0) + int(surplus * (r5_pct / 100)),
+        "others": (fee if others_count > 0 else 0) + rest_surplus_share
     }
     return {
         "collection": collection, "commission_amt": collection - pool, "comm_pct": comm_val,
         "pool": pool, "winners": winners_count, 
         "1st": prizes["1st"], "2nd": prizes["2nd"], "3rd": prizes["3rd"],
-        "4th": prizes["4th"], "5th": prizes["5th"], "6-10": prizes["6-10"],
-        "bottom": fee, "bottom_range": f"11-{winners_count}"
+        "4th": prizes["4th"], "5th": prizes["5th"], "6-10": prizes["others"],
+        "bottom": prizes["others"], "bottom_range": f"6-{winners_count}"
     }
 
-def prize_breakdown_render(match_id, fee, slots):
-    breakdown = get_prize_breakdown(fee, slots, match_id=match_id)
+def prize_breakdown_render(match_id, fee, slots, contest_type='J'):
+    breakdown = get_prize_breakdown(fee, slots, match_id=match_id, contest_type=contest_type)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 Back to Match", callback_data=f"show_match_{match_id}"))
     
     # Determine Label
-    c_type = "MEGA" if fee >= 100 else "MINI-JACKPOT" if fee >= 30 else "SAVER"
-    win_p = 35 if fee >= 100 else 25 if fee >= 30 else 60
-    payout_pct = 90 if fee < 30 else 82
+    c_type_label = "JACKPOT" if contest_type == 'J' else "TEAM SAVER"
+    win_p = 25 if contest_type == 'J' else 75
+    payout_pct = 90 if contest_type == 'S' else 82
 
     # Catchy labels
     r1_label = "🏆 JACKPOT" if fee >= 30 else "🥇 CHAMPION"
@@ -417,11 +437,10 @@ def match_dashboard_render(match_id, info, stats, user_summary, time_left, conte
     if contest_configs:
         for cfg in contest_configs:
             fee = cfg['entry_fee']
+            c_type = cfg.get('contest_type', 'J')
             
-            # Custom labeling based on entry level
-            if fee >= 100: label = f"🥇 Mega ₹{fee}"
-            elif fee >= 30: label = f"⚡ Mini-Jackpot ₹{fee}"
-            else: label = f"🛡️ Saver ₹{fee}"
+            if c_type == 'J': label = f"⚡ JACKPOT ₹{fee}"
+            else: label = f"🛡️ SAVER ₹{fee}"
 
             markup.row(types.InlineKeyboardButton(label, callback_data=f"join_{match_id}_{fee}"),
                        types.InlineKeyboardButton("📋 Breakup", callback_data=f"breakup_{match_id}_{fee}"))
@@ -487,28 +506,43 @@ def contest_selection_render(match_id, match_name):
     return markup, text
 
 def team_points_breakdown_render(match_id, team_num, team_data, player_stats_map):
-    res = f"📊 *TEAM PERFORMANCE (T{team_num})*\n━━━━━━━━━━━━━━━━━━━━\n"
+    res = f"📊 *TEAM PERFORMANCE | T{team_num}*\n"
+    res += "━━━━━━━━━━━━━━━━━━━━\n"
     total = 0
-    for role in ['bat', 'wk', 'ar', 'bowl', 'sub']:
+    
+    # Professional Role Mapping with Emojis
+    role_info = {
+        'wk': ('🧤', 'WICKETKEEPERS'),
+        'bat': ('🏏', 'BATSMEN'),
+        'ar': ('🌟', 'ALL-ROUNDERS'),
+        'bowl': ('🥎', 'BOWLERS'),
+        'sub': ('🔄', 'IMPACT PLAYERS')
+    }
+
+    for role in ['wk', 'bat', 'ar', 'bowl', 'sub']:
         p_list = team_data.get(role, [])
         if not p_list: continue
-        role_label = "IMPACT/SUB" if role == 'sub' else role.upper()
-        res += f"\n*{role_label}*\n"
+        
+        icon, label = role_info[role]
+        res += f"\n{icon} *{label}*\n"
+        
         for p in p_list:
             stats = player_stats_map.get(p, {'runs': 0, 'fours': 0, 'sixes': 0, 'wickets': 0})
             raw_pts = (stats['runs'] * 1 + stats['fours'] * 4 + stats['sixes'] * 6 + stats['wickets'] * 25)
             
             mult = 1.0
             tag = ""
-            if p == team_data.get('captain'): mult, tag = 2.0, "(C)"
-            elif p == team_data.get('vice_captain'): mult, tag = 1.5, "(VC)"
+            if p == team_data.get('captain'): mult, tag = 2.0, " (C) 👑"
+            elif p == team_data.get('vice_captain'): mult, tag = 1.5, " (VC) ⭐"
             
             p_final = int(raw_pts * mult)
             total += p_final
-            res += f"👤 {p} {tag}\n"
-            res += f"└ {stats['runs']} R | {stats['wickets']} W | `{p_final} pts`\n"
             
-    res += f"━━━━━━━━━━━━━━━━━━━━\n⭐ *Total Points: {total}*"
+            res += f"👤 `{p}`{tag}\n"
+            res += f"└ ⚡ *{p_final} pts* — ({stats['runs']}R | {stats['wickets']}W)\n"
+            
+    res += "\n━━━━━━━━━━━━━━━━━━━━\n"
+    res += f"🏆 *TOTAL SCORE: {total} PTS*"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 Back to Team", callback_data=f"view_team_{match_id}_{team_num}"))
     return markup, res
@@ -585,3 +619,100 @@ def team_view_render(match_id, match_name, team_num, team, is_locked, joined_fee
     )
     
     return markup, res
+
+def user_results_list_render(results):
+    """Professional view for completed matches history"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    res = "📜 *MY MATCH HISTORY*\n\nAapne jo matches khele hain unka result yahan hai:\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if not results:
+        res += "\n_Abhi tak koi completed match nahi mila._"
+    else:
+        for r in results:
+            # Prize emoji logic
+            p_icon = "💰" if "₹0" not in r['prize'] else "📉"
+            res += (
+                f"🏟 *{r['match_name']}*\n"
+                f"📅 {r['timestamp'][:10]} | Rank: *#{r['rank']}*\n"
+                f"⭐ Points: `{r['points']}` | {p_icon} Won: *{r['prize']}*\n"
+                "────────────────────\n"
+            )
+
+    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="my_results"))
+    markup.add(types.InlineKeyboardButton("🏠 Back to Home", callback_data="app_home"))
+    return markup, res
+
+def transaction_item_render(item):
+    """Renders a single transaction item in a professional, human-readable format."""
+    sign = "✅ +" if item['type'] == 'CREDIT' else "❌ -"
+    amount = abs(item['amount'])
+    date_time = datetime.strptime(item['timestamp'], '%Y-%m-%d %H:%M:%S').strftime('%d-%m %H:%M')
+    ref_id = item['reference_id']
+    
+    description = "Unknown Transaction"
+    icon = "❓"
+
+    if ref_id.startswith("PRIZE_"):
+        parts = ref_id.split('_')
+        # PRIZE_{match_id}_{fee}_{rank}_{user_id}_{team_num}
+        match_id = parts[1]
+        fee = parts[2]
+        rank = parts[3]
+        # Fetch contest type from DB if possible, otherwise default
+        cfg = db.db_get_contest_config(match_id, fee)
+        c_type = cfg.get('contest_type', 'J') if cfg else ('J' if int(fee) >= 30 else 'S')
+        type_name = "JACKPOT" if c_type == 'J' else "TEAM SAVER"
+        description = f"🏆 Prize: {type_name} (₹{fee}, Rank #{rank})"
+        icon = "💰"
+    elif ref_id.startswith("DEBIT_MATCH_"):
+        parts = ref_id.split('_')
+        # DEBIT_MATCH_{mid}_{tnum}_{ref_id}
+        match_id = parts[2]
+        team_num = parts[3]
+        description = f"🏏 Contest Join: {match_id} (T{team_num})"
+        icon = "⚔️"
+    elif ref_id.startswith("MANUAL_"):
+        description = "➕ Manual Deposit (Admin)"
+        icon = "🧑‍💻"
+    elif ref_id.startswith("UTR_"):
+        description = f"⬆️ UPI Deposit (UTR: {ref_id[4:]})"
+        icon = "💳"
+    elif ref_id.startswith("REF_BONUS_"):
+        description = "🎁 Referral Bonus"
+        icon = "🤝"
+    elif ref_id.startswith("WD_REF_"):
+        description = "⬇️ Withdrawal"
+        icon = "💸"
+
+    return f"`{date_time}` | {sign}₹{amount} | {icon} {description}"
+
+def audit_report_render(match_id, match_name, audit):
+    """Generates a professional fairness report for admin"""
+    # Consistency check
+    is_fair = (audit['entries'] == audit['db_paid_teams'])
+    status_icon = "✅ PASS" if is_fair else "⚠️ DISCREPANCY"
+    
+    # Admin profit calculation
+    profit = audit['in'] - audit['out']
+    
+    res = (
+        f"🛡️ *MATCH AUDIT REPORT*\n"
+        f"🏟 Match: `{match_name}`\n"
+        f"🆔 ID: `{match_id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *FINANCIAL CHECK:*\n"
+        f"📥 Total Collected: `₹{audit['in']}`\n"
+        f"📤 Total Distributed: `₹{audit['out']}`\n"
+        f"📈 Retained Profit: `₹{round(profit, 2)}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 *INTEGRITY CHECK:*\n"
+        f"📑 Ledger Entries: `{audit['entries']}`\n"
+        f"⚾ Paid Team Slots: `{audit['db_paid_teams']}`\n"
+        f"🏁 Winners Paid: `{audit['winners']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Verdict:* {status_icon}\n"
+    )
+    if not is_fair:
+        res += "\n🚨 *ALERT:* Ledger aur Team count match nahi kar rahe. Kuch users ko free entry mili ho sakti hai!"
+    
+    return res
