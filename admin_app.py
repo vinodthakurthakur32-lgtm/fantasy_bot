@@ -109,7 +109,8 @@ def handle_admin_nav(call, bot):
         final_bot.cmd_get_user_data(call.message, admin_id=call.from_user.id)
     
     elif nav.startswith("adm_bulk_up_"):
-        match_id = nav.split("_")[3]
+        # Robust parsing for match_id with underscores (adm_bulk_up_match_id)
+        match_id = "_".join(nav.split("_")[3:])
         bot.answer_callback_query(call.id)
         sent = bot.send_message(chat_id, f"📝 <b>BULK TOTALS: {match_id}</b>\n\nFormat: <code>Player Name | Runs | Wickets</code>\nMultiple lines bhein.\n\n<i>Note: Ye purane score ko overwrite kar dega.</i>", parse_mode='HTML')
         bot.register_next_step_handler(sent, final_bot.process_bulk_scoring, match_id)
